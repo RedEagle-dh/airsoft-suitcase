@@ -1,15 +1,17 @@
 import logging
+import os
+import random
 import threading
-import time
 import tkinter as tk
+from contextlib import suppress
 from typing import List, Optional
 
 from .game_utils import (
     CONFIG_PATH,
-    EXIT_CODE,
     VALID_KEYS,
     generate_code,
     initialize_audio,
+    is_truthy,
     play_audio,
     read_audio_setting,
 )
@@ -19,58 +21,61 @@ logger = logging.getLogger(__name__)
 
 
 class LogicWindow:
+    BOMB_DURATION_SECONDS = 10 * 60
+    BOMB_CODE_LENGTH = 20
+    BOMB_LOCK_SECONDS = (30, 60)
+
+    BUNKER_TARGET_SECONDS = 600
+
+    HASH_HOLD_MILLISECONDS = 3000
+
     def __init__(self, use_audio: bool) -> None:
-        self.extra_input: List[str] = []
         self.use_audio = bool(use_audio and initialize_audio())
         self.led = Led()
 
-        self.blue_counting = False
-        self.red_counting = False
-        self.blue_counter: Optional[threading.Thread] = None
-        self.red_counter: Optional[threading.Thread] = None
-        self.red_amount = 0
-        self.blue_amount = 0
-        self.red_time_label: Optional[tk.Label] = None
-        self.blue_time_label: Optional[tk.Label] = None
-
-        self.audio_thread: Optional[threading.Thread] = None
-        self.input_lock_thread: Optional[threading.Thread] = None
-        self.blinker: Optional[threading.Thread] = None
-
-        # Threading events (replace module-level globals)
-        self._stop_event = threading.Event()
-        self._stop_lock_event = threading.Event()
-        self._stop_red_event = threading.Event()
-        self._stop_blue_event = threading.Event()
-
-        # Bomb state
-        self.timer_label: Optional[tk.Label] = None
-        self.armed = False
-        self.info_label: Optional[tk.Label] = None
-        self.arm_code: Optional[str] = None
-        self.def_code: Optional[str] = None
-        self.arm_tries = 3
-        self.outer_blinker = False
-        self.bomb_tries = 3
-        self.input_lock = False
-        self.versuche_label: Optional[tk.Label] = None
-        self.input_label: Optional[tk.Label] = None
-
-        self.input: List[str] = []
-
-        # Selection logic
-        self.pressed_keys: List[str] = []
-        self.heights = [120, 220, 320]
         self.modes = ["Bombe", "Bunker", "Flagge"]
-        self.diffs = ["Easy", "Medium", "Hard"]
-        self.times = [5, 10, 15]
+        self.bomb_difficulties = ["Einfach", "Mittel", "Schwer"]
+
+        self.pressed_keys: List[str] = []
+
+        self.phase = "menu"
+        self.menu_level = "game"
+        self.selection = -1
+        self.is_in_game = False
+
         self.selected_game: Optional[str] = None
         self.selected_diff: Optional[str] = None
-        self.selected_time: Optional[int] = None
-        self.current = 0
-        self.selection = -1
-        self.game: Optional[str] = None
-        self.is_in_game = False
+
+        # Timed callbacks
+        self.hash_hold_job: Optional[str] = None
+        self.hash_key_down = False
+        self.bomb_tick_job: Optional[str] = None
+        self.bomb_lock_job: Optional[str] = None
+        self.bomb_beep_job: Optional[str] = None
+        self.bunker_tick_job: Optional[str] = None
+        self.bunker_signal_job: Optional[str] = None
+        self.game_end_job: Optional[str] = None
+
+        # Bomb state
+        self.bomb_stage = "idle"
+        self.bomb_expected_code = ""
+        self.bomb_input: List[str] = []
+        self.bomb_remaining = self.BOMB_DURATION_SECONDS
+        self.bomb_reentry_targets: List[int] = []
+        self.bomb_attempt = 0
+        self.bomb_lock_remaining = 0
+        self.bomb_resume_stage = ""
+        self.bomb_end_message = ""
+
+        # Bunker state
+        self.bunker_blue_seconds = 0
+        self.bunker_red_seconds = 0
+        self.bunker_active_team: Optional[str] = None
+        self.bunker_winner: Optional[str] = None
+        self.bunker_signal_active = False
+
+        # Flag state
+        self.flag_team: Optional[str] = None
 
         self.root = tk.Tk()
         self.root.attributes("-fullscreen", True)
@@ -81,520 +86,791 @@ class LogicWindow:
         self.root.geometry("800x480")
         self.root.configure(background="black")
 
-        self.select_label: Optional[tk.Label] = None
-        self.render_main_menu()
-
+        self.reset_to_menu()
         self.root.mainloop()
 
-    def render_main_menu(self) -> None:
-        self.render_menu("Spielauswahl:", ["Bombe", "Bunker", "Flagge"])
+    # ----------------------------
+    # General helpers
+    # ----------------------------
 
-    def render_menu(self, title: str, options: List[str]) -> None:
-        self.clear_frame()
-        tk.Label(self.root, name="text", text=title, bg="black", fg="green", font=("Ubuntu", 50)).pack()
+    def _cancel_job(self, job_name: str) -> None:
+        job = getattr(self, job_name)
+        if job is None:
+            return
+        with suppress(Exception):
+            self.root.after_cancel(job)
+        setattr(self, job_name, None)
 
-        for index, option in enumerate(options, start=1):
-            tk.Label(
-                self.root,
-                name=f"lable{index}",
-                text=f"{index}:{option}",
-                bg="black",
-                fg="green",
-                font=("Ubuntu", 45),
-            ).place(x=150, y=self.heights[index - 1])
+    def _cancel_all_jobs(self) -> None:
+        for job_name in (
+            "hash_hold_job",
+            "bomb_tick_job",
+            "bomb_lock_job",
+            "bomb_beep_job",
+            "bunker_tick_job",
+            "bunker_signal_job",
+            "game_end_job",
+        ):
+            self._cancel_job(job_name)
 
-        self.render_navigation_hints()
-        self.select_label = tk.Label(self.root, text="<--", bg="black", fg="green", font=("calibri light", 40))
+    def clear_frame(self) -> None:
+        for child in self.root.winfo_children():
+            child.destroy()
 
-    def render_navigation_hints(self) -> None:
-        tk.Label(self.root, name="dont1", text="Rot: Zurück", fg="green", bg="black", font=("Ubuntu", 30)).place(
-            relx=0.0, rely=1.0, anchor="sw"
-        )
-        tk.Label(self.root, name="dont2", text="Blau: Bestätigen", fg="green", bg="black", font=("Ubuntu", 30)).place(
-            relx=1.0, rely=1.0, anchor="se"
-        )
+    def format_time(self, seconds: int) -> str:
+        mins, secs = divmod(max(seconds, 0), 60)
+        return f"{mins:02d}:{secs:02d}"
 
-    def reset(self) -> None:
-        self.extra_input = []
+    def play_audio_async(self, name: str) -> None:
+        threading.Thread(target=play_audio, args=(name, self.use_audio), daemon=True).start()
 
-        self._stop_event.set()
-        self.join_thread(self.audio_thread)
+    def _beep_once(self) -> None:
+        with suppress(Exception):
+            self.root.bell()
+
+    def _extract_keypad_char(self, key: "tk.Event[tk.Misc]") -> str:
+        char = (getattr(key, "char", "") or "").upper()
+        if char in VALID_KEYS or char in {"#", "*"}:
+            return char
+
+        if key.keysym in {"numbersign", "KP_Hash"}:
+            return "#"
+        if key.keysym in {"asterisk", "KP_Multiply"}:
+            return "*"
+
+        if key.keysym in VALID_KEYS:
+            return key.keysym
+
+        return ""
+
+    def _is_blue_key(self, key: "tk.Event[tk.Misc]") -> bool:
+        return key.keysym in {"Return", "KP_Enter"}
+
+    def _is_red_key(self, key: "tk.Event[tk.Misc]") -> bool:
+        return key.keysym in {"Delete", "BackSpace"}
+
+    def _is_hash_key(self, key: "tk.Event[tk.Misc]") -> bool:
+        return self._extract_keypad_char(key) == "#"
+
+    def _is_star_key(self, key: "tk.Event[tk.Misc]") -> bool:
+        return self._extract_keypad_char(key) == "*"
+
+    def _is_selection_digit(self, key: "tk.Event[tk.Misc]") -> Optional[int]:
+        char = self._extract_keypad_char(key)
+        if char in {"1", "2", "3"}:
+            return int(char) - 1
+        return None
+
+    # ----------------------------
+    # Global reset/menu
+    # ----------------------------
+
+    def reset_to_menu(self) -> None:
+        self._cancel_all_jobs()
+
+        self.pressed_keys = []
+        self.hash_key_down = False
+
+        self.phase = "menu"
+        self.menu_level = "game"
+        self.selection = -1
+        self.is_in_game = False
+
+        self.selected_game = None
+        self.selected_diff = None
+
+        self.bomb_stage = "idle"
+        self.bomb_expected_code = ""
+        self.bomb_input = []
+        self.bomb_remaining = self.BOMB_DURATION_SECONDS
+        self.bomb_reentry_targets = []
+        self.bomb_attempt = 0
+        self.bomb_lock_remaining = 0
+        self.bomb_resume_stage = ""
+        self.bomb_end_message = ""
+
+        self.bunker_blue_seconds = 0
+        self.bunker_red_seconds = 0
+        self.bunker_active_team = None
+        self.bunker_winner = None
+        self.bunker_signal_active = False
+
+        self.flag_team = None
 
         self.led.stop_all_blinkers()
         self.led.turn_off_all()
-        self.blue_counting = False
-        self.red_counting = False
-        self.outer_blinker = False
+        self.led.pixel_fill((0, 0, 0))
+        self.led.turn_red_on()
+        self.led.turn_blue_on()
 
-        self._stop_lock_event.set()
-        self.join_thread(self.input_lock_thread)
-        self._stop_lock_event.clear()
+        self.render_menu()
 
-        self._stop_red_event.set()
-        self.join_thread(self.red_counter)
-        self._stop_red_event.clear()
-
-        self._stop_blue_event.set()
-        self.join_thread(self.blue_counter)
-        self._stop_blue_event.clear()
-
+    def render_menu(self) -> None:
         self.clear_frame()
-        self.red_amount = 0
-        self.blue_amount = 0
-        self.armed = False
-        self.audio_thread = None
-        self._stop_event.clear()
 
-        self.input_lock = False
-        self.selected_game = None
-        self.selected_diff = None
-        self.selected_time = None
-        self.is_in_game = False
-        self.input = []
-        self.current = 0
-        self.selection = -1
-        self.arm_tries = 3
-        self.bomb_tries = 3
+        title = "Spielauswahl:" if self.menu_level == "game" else "Bombe: Schwierigkeit"
+        options = self.modes if self.menu_level == "game" else self.bomb_difficulties
 
-        self.render_main_menu()
-        self.root.attributes("-fullscreen", True)
-        self.led.turn_off_all()
+        tk.Label(self.root, text=title, bg="black", fg="green", font=("Ubuntu", 50)).pack()
 
-    def join_thread(self, thread: Optional[threading.Thread]) -> None:
-        if thread is None:
-            return
-        if thread is threading.current_thread():
-            return
-        try:
-            thread.join(timeout=2)
-        except Exception:
-            logger.warning("Thread join failed", exc_info=True)
+        for idx, option in enumerate(options, start=1):
+            prefix = "<-- " if self.selection == (idx - 1) else "    "
+            tk.Label(
+                self.root,
+                text=f"{prefix}{idx}: {option}",
+                bg="black",
+                fg="green",
+                font=("Ubuntu", 42),
+                anchor="w",
+                justify="left",
+            ).place(x=120, y=100 + (idx * 90))
+
+        tk.Label(self.root, text="Rot: Zurück", fg="green", bg="black", font=("Ubuntu", 30)).place(
+            relx=0.0,
+            rely=1.0,
+            anchor="sw",
+        )
+        tk.Label(self.root, text="Blau: Bestätigen", fg="green", bg="black", font=("Ubuntu", 30)).place(
+            relx=1.0,
+            rely=1.0,
+            anchor="se",
+        )
+
+    # ----------------------------
+    # Key handling
+    # ----------------------------
 
     def keydown(self, key: "tk.Event[tk.Misc]") -> None:
-        if key.keysym not in self.pressed_keys:
-            self.pressed_keys.append(key.keysym)
-            self.game_select_input(key)
+        if key.keysym in self.pressed_keys:
+            return
+        self.pressed_keys.append(key.keysym)
+
+        if self._is_hash_key(key):
+            self.hash_key_down = True
+            if self.is_in_game:
+                self._start_hash_hold()
+            return
+
+        if self._is_star_key(key):
+            self._handle_star_press()
+            return
+
+        if not self.is_in_game:
+            self.handle_menu_input(key)
+            return
+
+        if self.phase == "bomb":
+            self.handle_bomb_input(key)
+        elif self.phase == "bunker":
+            self.handle_bunker_input(key)
+        elif self.phase == "flag":
+            self.handle_flag_input(key)
 
     def keyup(self, key: "tk.Event[tk.Misc]") -> None:
         if key.keysym in self.pressed_keys:
             self.pressed_keys.remove(key.keysym)
 
-    def game_select_input(self, key: "tk.Event[tk.Misc]") -> None:
-        if self.input_lock:
+        if self._is_hash_key(key):
+            self.hash_key_down = False
+            self._cancel_job("hash_hold_job")
             return
 
-        if not self.is_in_game:
-            self.handle_selection_input(key)
+        if self._is_star_key(key):
+            self._handle_star_release()
+
+    def _start_hash_hold(self) -> None:
+        if self.hash_hold_job is not None:
+            return
+        self.hash_hold_job = self.root.after(self.HASH_HOLD_MILLISECONDS, self._finish_hash_hold)
+
+    def _finish_hash_hold(self) -> None:
+        self.hash_hold_job = None
+        if self.hash_key_down and self.is_in_game:
+            self.reset_to_menu()
+
+    # ----------------------------
+    # Menu flow
+    # ----------------------------
+
+    def handle_menu_input(self, key: "tk.Event[tk.Misc]") -> None:
+        selection = self._is_selection_digit(key)
+        if selection is not None:
+            self.selection = selection
+            self.render_menu()
             return
 
-        if self.selected_game == "Bombe":
-            self.handle_bomb_input(key)
-        elif self.selected_game == "Flagge":
-            self.handle_flag_input(key)
-        elif self.selected_game == "Bunker":
-            self.handle_bunker_input(key)
+        if self._is_blue_key(key) and self.selection in {0, 1, 2}:
+            if self.menu_level == "game":
+                self.selected_game = self.modes[self.selection]
+                self.selection = -1
+                if self.selected_game == "Bombe":
+                    self.menu_level = "bomb_diff"
+                    self.render_menu()
+                    return
+                self.start_selected_game()
+                return
 
-    def handle_selection_input(self, key: "tk.Event[tk.Misc]") -> None:
-        if key.keysym in ["1", "2", "3"]:
-            self.selection = int(key.keysym) - 1
-            if self.select_label is not None:
-                self.select_label.configure(text="<--")
-                width, _height = self.get_label_width(key.keysym)
-                self.select_label.place(x=160 + width, y=self.heights[self.selection])
+            self.selected_diff = self.bomb_difficulties[self.selection]
+            self.start_selected_game()
             return
 
-        if key.keysym == "Return" and self.selection in range(0, 3):
-            self.confirm_selection()
-            return
-
-        if key.keysym == "Delete":
-            self.back_selection()
-
-    def confirm_selection(self) -> None:
-        if self.current == 0:
-            self.selected_game = self.modes[self.selection]
-            self.current = 1
+        if self._is_red_key(key) and self.menu_level == "bomb_diff":
+            self.menu_level = "game"
             self.selection = -1
-            self.render_menu("Schwierigkeit:", ["Easy", "Medium", "Hard"])
-        elif self.current == 1:
-            self.selected_diff = self.diffs[self.selection]
-            self.current = 2
-            self.selection = -1
-            self.render_menu("Zeit:", ["5Min", "10Min", "15Min"])
-        elif self.current == 2:
-            self.selected_time = self.times[self.selection]
-            self.clear_frame()
-            self.start_game()
-
-    def back_selection(self) -> None:
-        if self.current == 1:
             self.selected_game = None
-            self.current = 0
-            self.selection = -1
-            self.render_main_menu()
-        elif self.current == 2:
-            self.selected_diff = None
-            self.current = 1
-            self.selection = -1
-            self.render_menu("Schwierigkeit:", ["Easy", "Medium", "Hard"])
+            self.render_menu()
 
-    def handle_bomb_input(self, key: "tk.Event[tk.Misc]") -> None:
-        if key.keysym == "Delete":
-            self.clear_input()
-            return
-
-        if key.keysym == "Return":
-            candidate = "".join(self.input)
-            if not self.armed:
-                if candidate == self.arm_code:
-                    self.armed = True
-                    self.clear_input()
-                    self.defuse_bomb()
-                else:
-                    self.reduce_tries()
-            else:
-                if candidate == self.def_code:
-                    self.clear_input()
-                    self.bomb_defused()
-                else:
-                    self.reduce_tries()
-            return
-
-        self.append_input(key.keysym, 16)
-
-    def handle_flag_input(self, key: "tk.Event[tk.Misc]") -> None:
-        if key.keysym == "Delete":
-            self.clear_input()
-            self.led.pixel_fill((255, 0, 0))
-            self.led.turn_red_on()
-            self.led.turn_off_blue()
-            if self.info_label is not None:
-                self.info_label.configure(text="RED")
-            return
-
-        if key.keysym == "Return":
-            if self.is_exit_code_entered():
-                self.reset()
-                return
-            self.clear_input()
-            if self.info_label is not None:
-                self.info_label.configure(text="BLUE")
-            self.led.turn_off_red()
-            self.led.turn_blue_on()
-            self.led.pixel_fill((0, 0, 255))
-            return
-
-        self.append_input(key.keysym, len(EXIT_CODE))
-
-    def handle_bunker_input(self, key: "tk.Event[tk.Misc]") -> None:
-        if key.keysym == "Delete":
-            self.clear_input()
-            self.led.turn_red_on()
-            self.led.turn_off_blue()
-            self.led.pixel_fill((255, 0, 0))
-
-            self._stop_blue_event.set()
-            self.join_thread(self.blue_counter)
-            self._stop_blue_event.clear()
-
-            if not self.red_counting:
-                self.red_counter = threading.Thread(target=self.red_timer, daemon=True)
-                self.red_counter.start()
-            return
-
-        if key.keysym == "Return":
-            if self.is_exit_code_entered():
-                self.led.turn_off_blue()
-                self.reset()
-                return
-
-            self.clear_input()
-            self._stop_red_event.set()
-            self.join_thread(self.red_counter)
-            self._stop_red_event.clear()
-
-            if not self.blue_counting:
-                self.blue_counter = threading.Thread(target=self.blue_timer, daemon=True)
-                self.blue_counter.start()
-
-            self.led.turn_off_red()
-            self.led.turn_blue_on()
-            self.led.pixel_fill((0, 0, 255))
-            return
-
-        self.append_input(key.keysym, len(EXIT_CODE))
-
-    def append_input(self, key: str, max_length: int) -> None:
-        if key not in VALID_KEYS:
-            return
-        if len(self.input) >= max_length:
-            return
-        self.input.append(key)
-        if self.input_label is not None:
-            self.input_label.configure(text="".join(self.input))
-
-    def clear_input(self) -> None:
-        self.input = []
-        if self.input_label is not None:
-            self.input_label.configure(text="")
-
-    def is_exit_code_entered(self) -> bool:
-        return "".join(self.input) == EXIT_CODE
-
-    def play_audio_async(self, name: str) -> None:
-        threading.Thread(target=play_audio, args=(name, self.use_audio), daemon=True).start()
-
-    def start_game(self) -> None:
+    def start_selected_game(self) -> None:
         if self.selected_game == "Bombe":
-            self.is_in_game = True
-            self.arm_code = generate_code(16)
-            self.def_code = generate_code(16)
-            self.arm_bomb()
-            self.arm_tries = 3
+            self.start_bomb_game()
         elif self.selected_game == "Bunker":
-            self.is_in_game = True
-            self.bunker()
+            self.start_bunker_game()
         elif self.selected_game == "Flagge":
-            self.is_in_game = True
-            self.flag()
+            self.start_flag_game()
 
-    def clear_frame(self) -> None:
-        for wi in self.root.winfo_children():
-            wi.destroy()
+    # ----------------------------
+    # Bomb mode
+    # ----------------------------
 
-    def set_labels(self, values: List[str]) -> None:
-        for wi in self.root.winfo_children():
-            if str(wi) == ".lable1":
-                wi.configure(text=values[0])
-            elif str(wi) == ".lable2":
-                wi.configure(text=values[1])
-            elif str(wi) == ".lable3":
-                wi.configure(text=values[2])
-            elif str(wi) == ".text":
-                wi.configure(text=values[3])
+    def _build_reentry_targets(self, difficulty: str) -> List[int]:
+        if difficulty == "Einfach":
+            return []
+        if difficulty == "Mittel":
+            return [random.randint(180, 420)]
 
-    def get_label_width(self, key: str) -> List[int]:
-        label_name = {
-            "1": ".lable1",
-            "2": ".lable2",
-            "3": ".lable3",
-        }.get(key)
+        # Schwer: zwei stop-points zwischen Minute 3 und 7.
+        values = random.sample(range(180, 421), 2)
+        values.sort(reverse=True)
+        return values
 
-        if label_name is None:
-            return [0, 0]
+    def start_bomb_game(self) -> None:
+        self.is_in_game = True
+        self.phase = "bomb"
 
-        for wi in self.root.winfo_children():
-            if str(wi) == label_name:
-                return [wi.winfo_width(), wi.winfo_height()]
-        return [0, 0]
+        diff = self.selected_diff or "Einfach"
+        self.bomb_stage = "await_nfc" if diff == "Schwer" else "await_code"
+        if diff == "Schwer" and is_truthy(os.getenv("AIRSOFT_NFC_AUTO_UNLOCK")):
+            self.bomb_stage = "await_code"
 
-    def arm_bomb(self) -> None:
-        self.clear_frame()
+        self.bomb_expected_code = generate_code(self.BOMB_CODE_LENGTH)
+        self.bomb_input = []
+        self.bomb_remaining = self.BOMB_DURATION_SECONDS
+        self.bomb_reentry_targets = self._build_reentry_targets(diff)
+        self.bomb_attempt = 0
+        self.bomb_lock_remaining = 0
+        self.bomb_resume_stage = ""
+        self.bomb_end_message = ""
+
+        self._prepare_bomb_idle_leds()
+        self.render_bomb()
+
+    def _bomb_blue_interval(self) -> float:
+        if self.bomb_remaining <= 60:
+            return 0.20
+        if self.bomb_remaining <= 300:
+            return 0.45
+        return 0.85
+
+    def _bomb_tank_interval(self) -> float:
+        if self.bomb_remaining <= 60:
+            return 0.05
+        if self.bomb_remaining <= 300:
+            return 0.10
+        return 0.16
+
+    def _bomb_beep_interval_ms(self) -> int:
+        if self.bomb_remaining <= 60:
+            return 180
+        if self.bomb_remaining <= 300:
+            return 340
+        return 650
+
+    def _prepare_bomb_idle_leds(self) -> None:
+        self.led.stop_all_blinkers()
+        self.led.turn_off_all()
+        self.led.pixel_fill((0, 0, 0))
         self.led.turn_blue_on()
-        tk.Label(self.root, fg="green", bg="black", text="Bombe legen", font=("Ubuntu", 50)).pack()
-        tk.Label(self.root, fg="green", bg="black", text="Code:", font=("Ubuntu", 15)).place(x=20, y=160)
-        tk.Label(self.root, fg="green", bg="black", text=self.arm_code, font=("Ubuntu", 15)).place(x=100, y=160)
-        tk.Label(self.root, fg="green", bg="black", text="Eingabe:", font=("Ubuntu", 30)).place(x=10, y=220)
-        tk.Label(self.root, fg="green", bg="black", text="Versuche:", font=("Ubuntu", 30)).place(x=10, y=280)
-        self.versuche_label = tk.Label(
-            self.root, fg="green", bg="black", text=str(self.bomb_tries), font=("Ubuntu", 30)
-        )
-        self.versuche_label.place(x=210, y=280)
-        self.input_label = tk.Label(self.root, fg="green", bg="black", text="", font=("Ubuntu", 30))
-        self.input_label.place(x=180, y=220)
-        self.info_label = tk.Label(self.root, fg="green", bg="black", text="", font=("Ubuntu", 30))
-        self.info_label.place(x=10, y=350)
-        self.root.update()
 
-    def defuse_bomb(self) -> None:
+    def _prepare_bomb_countdown_leds(self) -> None:
         self.led.stop_all_blinkers()
         self.led.turn_off_all()
 
+        self.led.set_blue_interval(self._bomb_blue_interval())
         self.led.start_blue_blinker()
 
         self.led.set_rgb((0, 255, 0))
-        self.play_audio_async("Arm")
-        self.clear_frame()
-        self.timer_label = tk.Label(self.root, fg="green", bg="black", text="", font=("Ubuntu", 50))
-        self.timer_label.pack()
-        tk.Label(self.root, fg="green", bg="black", text="Code:", font=("Ubuntu", 15)).place(x=20, y=160)
-        tk.Label(self.root, fg="green", bg="black", text=self.def_code, font=("Ubuntu", 15)).place(x=100, y=160)
-        tk.Label(self.root, fg="green", bg="black", text="Eingabe:", font=("Ubuntu", 30)).place(x=10, y=220)
-        tk.Label(self.root, fg="green", bg="black", text="Versuche:", font=("Ubuntu", 30)).place(x=10, y=280)
-        self.versuche_label = tk.Label(
-            self.root, fg="green", bg="black", text=str(self.arm_tries), font=("Ubuntu", 30)
-        )
-        self.versuche_label.place(x=210, y=280)
-        self.input_label = tk.Label(self.root, fg="green", bg="black", text="", font=("Ubuntu", 30))
-        self.input_label.place(x=180, y=220)
-        self.info_label = tk.Label(self.root, fg="green", bg="black", text="", font=("Ubuntu", 30))
-        self.info_label.place(x=10, y=350)
-        self.audio_thread = threading.Thread(target=self.timer, daemon=True)
-        self.audio_thread.start()
+        self.led.set_stripe_interval(self._bomb_tank_interval())
         self.led.start_stripe_blinker(True)
 
-    def timer(self) -> None:
-        if self.selected_time is None:
+    def _update_bomb_countdown_leds(self) -> None:
+        self.led.set_blue_interval(self._bomb_blue_interval())
+        self.led.set_stripe_interval(self._bomb_tank_interval())
+
+    def _schedule_bomb_tick(self) -> None:
+        if self.bomb_tick_job is not None:
+            return
+        self.bomb_tick_job = self.root.after(1000, self._tick_bomb)
+
+    def _tick_bomb(self) -> None:
+        self.bomb_tick_job = None
+        if self.phase != "bomb" or self.bomb_stage != "countdown":
             return
 
-        ctime = self.selected_time * 60
-        while ctime and not self._stop_event.is_set():
-            if ctime == (self.selected_time * 60) / 2:
-                self.outer_blinker = True
-                self.led.start_red_blinker()
-                self.led.stop_blue_blinker()
-                if not self.led.get_red_is_alive():
-                    self.led.start_red_blinker()
+        self.bomb_remaining -= 1
+        if self.bomb_remaining <= 0:
+            self._finish_bomb_timer_elapsed()
+            return
 
-            mins, secs = divmod(ctime, 60)
-            timeformat = f"{mins:02d}:{secs:02d}"
-            if self.timer_label is not None:
-                self.timer_label.configure(text=timeformat)
-            time.sleep(1)
-            ctime -= 1
+        if self.bomb_reentry_targets and self.bomb_remaining == self.bomb_reentry_targets[0]:
+            self.bomb_reentry_targets.pop(0)
+            self._pause_bomb_for_reentry()
+            return
 
-        if ctime == 0:
-            if self.timer_label is not None:
-                self.timer_label.configure(text="00:00")
-            self.root.update()
-            self.explosion()
+        self._update_bomb_countdown_leds()
+        self.render_bomb()
+        self._schedule_bomb_tick()
 
-    def explosion(self) -> None:
+    def _schedule_bomb_beep(self) -> None:
+        if self.bomb_beep_job is not None:
+            return
+        self.bomb_beep_job = self.root.after(self._bomb_beep_interval_ms(), self._tick_bomb_beep)
+
+    def _tick_bomb_beep(self) -> None:
+        self.bomb_beep_job = None
+        if self.phase != "bomb" or self.bomb_stage != "countdown":
+            return
+        self._beep_once()
+        self._schedule_bomb_beep()
+
+    def _start_bomb_countdown(self, play_arm_sound: bool) -> None:
+        self.bomb_stage = "countdown"
+        self.bomb_input = []
+
+        if play_arm_sound:
+            self.play_audio_async("Arm")
+
+        self._prepare_bomb_countdown_leds()
+        self.render_bomb()
+        self._schedule_bomb_tick()
+        self._schedule_bomb_beep()
+
+    def _pause_bomb_for_reentry(self) -> None:
+        self._cancel_job("bomb_tick_job")
+        self._cancel_job("bomb_beep_job")
+
+        self.bomb_stage = "await_reentry"
+        self.bomb_expected_code = generate_code(self.BOMB_CODE_LENGTH)
+        self.bomb_input = []
+        self.bomb_attempt = 0
+
+        self._prepare_bomb_idle_leds()
+        self.render_bomb()
+
+    def _start_bomb_lock(self, seconds: int) -> None:
+        self._cancel_job("bomb_tick_job")
+        self._cancel_job("bomb_beep_job")
+
+        self.bomb_resume_stage = self.bomb_stage
+        self.bomb_stage = "locked"
+        self.bomb_lock_remaining = seconds
+        self.bomb_input = []
+
+        self.led.stop_all_blinkers()
+        self.led.turn_off_all()
+        self.led.pixel_fill((0, 0, 0))
+        self.led.set_red_interval(0.25)
+        self.led.start_red_blinker()
+
+        self.render_bomb()
+        self.bomb_lock_job = self.root.after(1000, self._tick_bomb_lock)
+
+    def _tick_bomb_lock(self) -> None:
+        self.bomb_lock_job = None
+        if self.phase != "bomb" or self.bomb_stage != "locked":
+            return
+
+        self.bomb_lock_remaining -= 1
+        if self.bomb_lock_remaining <= 0:
+            self.bomb_stage = self.bomb_resume_stage or "await_code"
+            self.bomb_resume_stage = ""
+            self.led.stop_red_blinker()
+            self._prepare_bomb_idle_leds()
+            self.render_bomb()
+            return
+
+        self.render_bomb()
+        self.bomb_lock_job = self.root.after(1000, self._tick_bomb_lock)
+
+    def _handle_wrong_bomb_code(self) -> None:
+        self.bomb_attempt += 1
+        if self.bomb_attempt <= len(self.BOMB_LOCK_SECONDS):
+            self._start_bomb_lock(self.BOMB_LOCK_SECONDS[self.bomb_attempt - 1])
+            return
+
+        self._finish_bomb_failed_input()
+
+    def _finish_bomb_failed_input(self) -> None:
+        self.bomb_stage = "ended"
+        self.bomb_end_message = "Zu viele Fehlversuche. Platzierer-Team verliert."
+
+        self._cancel_job("bomb_tick_job")
+        self._cancel_job("bomb_lock_job")
+        self._cancel_job("bomb_beep_job")
+
         self.led.stop_all_blinkers()
         self.led.turn_off_all()
         self.led.turn_red_on()
         self.led.pixel_fill((255, 0, 0))
-        if self.info_label is not None:
-            self.info_label.configure(text="Bombe ist explodiert")
-        self.root.update()
-        self.input_lock = True
-        self._stop_event.set()
-        self._stop_lock_event.set()
-
-        self.join_thread(self.input_lock_thread)
-        self._stop_lock_event.clear()
-
-        self.join_thread(self.audio_thread)
-        self.root.update()
-
-        self.play_audio_async("Boom")
-        time.sleep(20)
-        self.reset()
-
-    def reduce_tries(self) -> None:
-        if not self.armed:
-            if self.bomb_tries - 1 > 0:
-                self.bomb_tries -= 1
-                lock_time = self.calculate_lock_time(self.bomb_tries)
-                if self.versuche_label is not None:
-                    self.versuche_label.configure(text=self.bomb_tries)
-                if self.info_label is not None:
-                    self.info_label.configure(text=f"Falsche eingabe\nEingabe für: {lock_time} sekunden gesperrt")
-                self.clear_input()
-                self.input_lock_thread = threading.Thread(target=self.lock_input, args=(lock_time,), daemon=True)
-                self.input_lock_thread.start()
-            else:
-                if self.info_label is not None:
-                    self.info_label.configure(text="Zu viele versuche\nBombe ist deaktiviert")
-        else:
-            if self.arm_tries - 1 > 0:
-                self.arm_tries -= 1
-                lock_time = self.calculate_lock_time(self.arm_tries)
-                if self.versuche_label is not None:
-                    self.versuche_label.configure(text=self.arm_tries)
-                if self.info_label is not None:
-                    self.info_label.configure(text=f"Falsche eingabe\nEingabe für: {lock_time} sekunden gesperrt")
-                self.clear_input()
-                self.input_lock_thread = threading.Thread(target=self.lock_input, args=(lock_time,), daemon=True)
-                self.input_lock_thread.start()
-            else:
-                if self.info_label is not None:
-                    self.info_label.configure(text="Zu viele versuche\nBombe ist explodiert")
-                self.explosion()
-
-    def calculate_lock_time(self, tries_left: int) -> int:
-        return 10 * (4 - tries_left)
-
-    def lock_input(self, ctime: int) -> None:
-        self.input_lock = True
-        if not self.led.get_red_is_alive():
-            self.led.start_red_blinker()
-
-        elapsed = 0
-        while elapsed < ctime and not self._stop_lock_event.is_set():
-            time.sleep(1)
-            elapsed += 1
-
-        self.input_lock = False
-        if not self.outer_blinker:
-            self.led.stop_red_blinker()
-        if not self._stop_lock_event.is_set() and self.info_label is not None:
-            self.info_label.configure(text="")
-
-    def flag(self) -> None:
-        tk.Label(self.root, fg="green", bg="black", text="Flagge", font=("Ubuntu", 50)).pack()
-        self.info_label = tk.Label(self.root, fg="green", bg="black", text="", font=("Ubuntu", 90))
-        self.info_label.place(x=200, y=200)
-
-    def bomb_defused(self) -> None:
-        if self.info_label is not None:
-            self.info_label.configure(text="Die Bombe wurde entschärft")
-        self.led.set_rgb((0, 255, 0))
-        self.led.pixel_fill((0, 255, 0))
-
-        self._stop_event.set()
-        self.join_thread(self.audio_thread)
-        self.root.update()
 
         self.play_audio_async("Defuse")
-        time.sleep(20)
-        self.reset()
+        self.render_bomb()
+        self.game_end_job = self.root.after(3000, self.reset_to_menu)
 
-    def red_timer(self) -> None:
-        ctime = self.red_amount
-        self.red_counting = True
-        while True:
-            if self._stop_red_event.is_set():
-                self.red_amount = ctime
-                self.red_counting = False
-                break
-            mins, secs = divmod(ctime, 60)
-            timeformat = f"{mins:02d}:{secs:02d}"
-            if self.red_time_label is not None:
-                self.red_time_label.configure(text=timeformat)
-            time.sleep(1)
-            ctime += 1
+    def _finish_bomb_timer_elapsed(self) -> None:
+        self.bomb_stage = "ended"
+        self.bomb_end_message = "Zeit abgelaufen. Platzierer-Team gewinnt."
 
-    def blue_timer(self) -> None:
-        self.blue_counting = True
-        ctime = self.blue_amount
-        while True:
-            if self._stop_blue_event.is_set():
-                self.blue_counting = False
-                self.blue_amount = ctime
-                break
-            mins, secs = divmod(ctime, 60)
-            timeformat = f"{mins:02d}:{secs:02d}"
-            if self.blue_time_label is not None:
-                self.blue_time_label.configure(text=timeformat)
-            time.sleep(1)
-            ctime += 1
+        self._cancel_job("bomb_tick_job")
+        self._cancel_job("bomb_lock_job")
+        self._cancel_job("bomb_beep_job")
 
-    def bunker(self) -> None:
+        self.led.stop_all_blinkers()
+        self.led.turn_off_all()
+        self.led.turn_red_on()
+        self.led.pixel_fill((255, 0, 0))
+
+        self.play_audio_async("Boom")
+        self.render_bomb()
+        self.game_end_job = self.root.after(3000, self.reset_to_menu)
+
+    def handle_bomb_input(self, key: "tk.Event[tk.Misc]") -> None:
+        if self.bomb_stage in {"ended", "locked"}:
+            return
+
+        if self._is_red_key(key):
+            self.bomb_input = []
+            self.render_bomb()
+            return
+
+        if self._is_blue_key(key):
+            candidate = "".join(self.bomb_input)
+            if not candidate:
+                return
+
+            self.bomb_input = []
+
+            if self.bomb_stage not in {"await_code", "await_reentry"}:
+                self.render_bomb()
+                return
+
+            if candidate == self.bomb_expected_code:
+                self.bomb_attempt = 0
+                if self.bomb_stage == "await_code":
+                    self._start_bomb_countdown(play_arm_sound=True)
+                else:
+                    self._start_bomb_countdown(play_arm_sound=False)
+                return
+
+            self._handle_wrong_bomb_code()
+            return
+
+        char = self._extract_keypad_char(key)
+        if self.bomb_stage == "await_nfc":
+            if char == "A":
+                self.bomb_stage = "await_code"
+                self.bomb_input = []
+                self.bomb_attempt = 0
+                self.render_bomb()
+            return
+
+        if self.bomb_stage not in {"await_code", "await_reentry"}:
+            return
+
+        if char not in VALID_KEYS:
+            return
+
+        if len(self.bomb_input) >= self.BOMB_CODE_LENGTH:
+            return
+
+        self.bomb_input.append(char)
+        self.render_bomb()
+
+    def render_bomb(self) -> None:
         self.clear_frame()
-        tk.Label(self.root, fg="green", bg="black", text="Bunker:", font=("Ubuntu", 50)).pack()
-        tk.Label(self.root, fg="green", bg="black", text="Blue:", font=("Ubuntu", 90)).place(x=10, y=180)
-        tk.Label(self.root, fg="green", bg="black", text="Red:", font=("Ubuntu", 90)).place(x=25, y=340)
 
-        self.blue_time_label = tk.Label(self.root, fg="green", bg="black", text="00:00", font=("Ubuntu", 90))
-        self.blue_time_label.place(x=320, y=180)
+        tk.Label(self.root, fg="green", bg="black", text="Bombe", font=("Ubuntu", 50)).pack()
+        tk.Label(
+            self.root,
+            fg="green",
+            bg="black",
+            text=f"Zeit: {self.format_time(self.bomb_remaining)}",
+            font=("Ubuntu", 44),
+        ).pack()
 
-        self.red_time_label = tk.Label(self.root, fg="green", bg="black", text="00:00", font=("Ubuntu", 90))
-        self.red_time_label.place(x=320, y=340)
+        if self.bomb_stage == "await_nfc":
+            tk.Label(
+                self.root,
+                fg="green",
+                bg="black",
+                text="Schwer-Modus: NFC-Karte scannen",
+                font=("Ubuntu", 30),
+            ).pack(pady=20)
+            tk.Label(
+                self.root,
+                fg="green",
+                bg="black",
+                text="Simulation: Taste A",
+                font=("Ubuntu", 20),
+            ).pack()
+            tk.Label(
+                self.root,
+                fg="green",
+                bg="black",
+                text="# 3s halten = Hauptmenü",
+                font=("Ubuntu", 20),
+            ).pack(pady=12)
+            return
 
-        self.info_label = tk.Label(self.root, fg="green", bg="black", text="", font=("Ubuntu", 30))
-        self.info_label.place(x=10, y=350)
-        self.root.update()
+        if self.bomb_stage in {"await_code", "await_reentry"}:
+            prompt = "Code zum Start:" if self.bomb_stage == "await_code" else "Neuer Code erforderlich:"
+            tk.Label(self.root, fg="green", bg="black", text=prompt, font=("Ubuntu", 28)).pack(pady=8)
+            tk.Label(self.root, fg="green", bg="black", text=self.bomb_expected_code, font=("Ubuntu", 17)).pack()
+            tk.Label(
+                self.root,
+                fg="green",
+                bg="black",
+                text=f"Eingabe: {''.join(self.bomb_input)}",
+                font=("Ubuntu", 32),
+            ).pack(pady=16)
+            tk.Label(
+                self.root,
+                fg="green",
+                bg="black",
+                text=f"Fehlversuche: {self.bomb_attempt}/3",
+                font=("Ubuntu", 24),
+            ).pack()
+            tk.Label(
+                self.root,
+                fg="green",
+                bg="black",
+                text="# 3s halten = Hauptmenü",
+                font=("Ubuntu", 18),
+            ).pack(pady=10)
+            return
+
+        if self.bomb_stage == "locked":
+            tk.Label(
+                self.root,
+                fg="red",
+                bg="black",
+                text=f"Eingabe gesperrt: {self.bomb_lock_remaining}s",
+                font=("Ubuntu", 44),
+            ).pack(pady=40)
+            tk.Label(self.root, fg="red", bg="black", text="# 3s halten = Hauptmenü", font=("Ubuntu", 18)).pack()
+            return
+
+        if self.bomb_stage == "countdown":
+            tk.Label(self.root, fg="green", bg="black", text="Countdown läuft", font=("Ubuntu", 34)).pack(pady=40)
+            tk.Label(self.root, fg="green", bg="black", text="# 3s halten = Hauptmenü", font=("Ubuntu", 20)).pack()
+            return
+
+        if self.bomb_stage == "ended":
+            tk.Label(self.root, fg="red", bg="black", text=self.bomb_end_message, font=("Ubuntu", 34)).pack(pady=40)
+            tk.Label(self.root, fg="green", bg="black", text="Rückkehr zum Hauptmenü...", font=("Ubuntu", 22)).pack()
+
+    # ----------------------------
+    # Bunker mode
+    # ----------------------------
+
+    def start_bunker_game(self) -> None:
+        self.is_in_game = True
+        self.phase = "bunker"
+
+        self.bunker_blue_seconds = 0
+        self.bunker_red_seconds = 0
+        self.bunker_active_team = None
+        self.bunker_winner = None
+        self.bunker_signal_active = False
+
+        self.led.stop_all_blinkers()
+        self.led.turn_off_all()
+        self.led.pixel_fill((0, 0, 0))
+
+        self.render_bunker()
+        self._schedule_bunker_tick()
+
+    def _set_bunker_team(self, team: str) -> None:
+        if self.bunker_winner is not None:
+            return
+
+        self.bunker_active_team = team
+
+        self.led.stop_all_blinkers()
+        self.led.turn_off_all()
+
+        if team == "red":
+            self.led.turn_red_on()
+            self.led.set_rgb((255, 0, 0))
+        else:
+            self.led.turn_blue_on()
+            self.led.set_rgb((0, 0, 255))
+
+        self.led.set_stripe_interval(0.28)
+        self.led.start_stripe_blinker(True)
+
+        self.render_bunker()
+
+    def _schedule_bunker_tick(self) -> None:
+        if self.bunker_tick_job is not None:
+            return
+        self.bunker_tick_job = self.root.after(1000, self._tick_bunker)
+
+    def _tick_bunker(self) -> None:
+        self.bunker_tick_job = None
+        if self.phase != "bunker":
+            return
+
+        if self.bunker_winner is None:
+            if self.bunker_active_team == "blue":
+                self.bunker_blue_seconds += 1
+            elif self.bunker_active_team == "red":
+                self.bunker_red_seconds += 1
+
+            if self.bunker_blue_seconds >= self.BUNKER_TARGET_SECONDS:
+                self.bunker_winner = "blue"
+                self.bunker_active_team = "blue"
+            elif self.bunker_red_seconds >= self.BUNKER_TARGET_SECONDS:
+                self.bunker_winner = "red"
+                self.bunker_active_team = "red"
+
+        self.render_bunker()
+        if self.bunker_winner is None:
+            self._schedule_bunker_tick()
+
+    def _schedule_bunker_signal(self) -> None:
+        if self.bunker_signal_job is not None:
+            return
+        self.bunker_signal_job = self.root.after(220, self._tick_bunker_signal)
+
+    def _tick_bunker_signal(self) -> None:
+        self.bunker_signal_job = None
+        if self.phase != "bunker" or not self.bunker_signal_active:
+            return
+        self._beep_once()
+        self._schedule_bunker_signal()
+
+    def _handle_star_press(self) -> None:
+        if self.phase == "bunker" and self.bunker_winner is not None and not self.bunker_signal_active:
+            self.bunker_signal_active = True
+            self.render_bunker()
+            self._schedule_bunker_signal()
+
+    def _handle_star_release(self) -> None:
+        if self.phase == "bunker" and self.bunker_signal_active:
+            self.bunker_signal_active = False
+            self._cancel_job("bunker_signal_job")
+            self.reset_to_menu()
+
+    def handle_bunker_input(self, key: "tk.Event[tk.Misc]") -> None:
+        if self._is_red_key(key):
+            self._set_bunker_team("red")
+            return
+        if self._is_blue_key(key):
+            self._set_bunker_team("blue")
+
+    def render_bunker(self) -> None:
+        self.clear_frame()
+
+        tk.Label(self.root, fg="green", bg="black", text="Bunker", font=("Ubuntu", 52)).pack()
+
+        if self.bunker_active_team is None:
+            tk.Label(self.root, fg="green", bg="black", text="Warte auf Team...", font=("Ubuntu", 34)).pack(pady=20)
+        else:
+            active_seconds = self.bunker_blue_seconds if self.bunker_active_team == "blue" else self.bunker_red_seconds
+            active_color = "BLUE" if self.bunker_active_team == "blue" else "RED"
+            tk.Label(
+                self.root,
+                fg="green",
+                bg="black",
+                text=f"{active_color} {self.format_time(active_seconds)}",
+                font=("Ubuntu", 76),
+            ).pack(pady=16)
+
+        times_text = (
+            f"Blue: {self.format_time(self.bunker_blue_seconds)}   "
+            f"Red: {self.format_time(self.bunker_red_seconds)}"
+        )
+        tk.Label(self.root, fg="green", bg="black", text=times_text, font=("Ubuntu", 24)).pack(pady=8)
+
+        if self.bunker_winner is None:
+            tk.Label(
+                self.root,
+                fg="green",
+                bg="black",
+                text=f"Ziel: {self.BUNKER_TARGET_SECONDS}s | # 3s halten = Hauptmenü",
+                font=("Ubuntu", 18),
+            ).pack(pady=12)
+        else:
+            winner_label = "BLUE" if self.bunker_winner == "blue" else "RED"
+            if self.bunker_signal_active:
+                text = f"{winner_label} gewonnen - Signal aktiv"  # solange * gehalten wird
+            else:
+                text = f"{winner_label} bei 600s - * gedrückt halten zum Beenden"
+            tk.Label(self.root, fg="red", bg="black", text=text, font=("Ubuntu", 24)).pack(pady=12)
+
+    # ----------------------------
+    # Flag mode
+    # ----------------------------
+
+    def start_flag_game(self) -> None:
+        self.is_in_game = True
+        self.phase = "flag"
+        self.flag_team = None
+
+        self.led.stop_all_blinkers()
+        self.led.turn_off_all()
+        self.led.pixel_fill((0, 0, 0))
+
+        self.render_flag()
+
+    def _set_flag_team(self, team: str) -> None:
+        self.flag_team = team
+
+        self.led.stop_all_blinkers()
+        self.led.turn_off_all()
+
+        if team == "red":
+            self.led.turn_red_on()
+            self.led.set_rgb((255, 0, 0))
+        else:
+            self.led.turn_blue_on()
+            self.led.set_rgb((0, 0, 255))
+
+        self.led.set_stripe_interval(0.25)
+        self.led.start_stripe_blinker(True)
+
+        self.render_flag()
+
+    def handle_flag_input(self, key: "tk.Event[tk.Misc]") -> None:
+        if self._is_red_key(key):
+            self._set_flag_team("red")
+            return
+        if self._is_blue_key(key):
+            self._set_flag_team("blue")
+
+    def render_flag(self) -> None:
+        self.clear_frame()
+
+        tk.Label(self.root, fg="green", bg="black", text="Flagge", font=("Ubuntu", 52)).pack(pady=10)
+
+        label = "-"
+        if self.flag_team == "red":
+            label = "ROT"
+        elif self.flag_team == "blue":
+            label = "BLAU"
+
+        tk.Label(self.root, fg="green", bg="black", text=label, font=("Ubuntu", 140)).pack(pady=30)
+        tk.Label(self.root, fg="green", bg="black", text="# 3s halten = Hauptmenü", font=("Ubuntu", 22)).pack()
 
 
 def main() -> None:

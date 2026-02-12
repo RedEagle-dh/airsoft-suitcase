@@ -280,7 +280,7 @@ class Led:
         while not self._stripe_blinker_stop:
             color = tuple(int(channel * intensity) for channel in self._stripe_rgb)
             self._pixel.fill(color)
-            time.sleep(0.1)
+            time.sleep(self._stripe_interval)
 
             intensity += direction * 0.1
             if intensity <= 0.1:
