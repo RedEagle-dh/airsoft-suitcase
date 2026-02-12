@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Airsoft Suitcase Preview</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <section class="screen-wrap">
+        <div class="screen-header">
+          <h1>Raspberry Pi UI Preview</h1>
+          <p>Keyboard: <code>1/2/3</code>, <code>Enter</code>, <code>Backspace/Delete</code>, <code>A-D</code></p>
+        </div>
+        <div class="pi-screen" id="pi-screen">
+          <div class="title" id="title"></div>
+          <div class="content" id="content"></div>
+          <div class="footer" id="footer">
+            <span>Rot: Zurück</span>
+            <span>Blau: Bestätigen</span>
+          </div>
+        </div>
+      </section>
+
+      <aside class="logs-wrap">
+        <h2>GPIO Simulation Logs</h2>
+        <p>These events show what physical GPIO/LED hardware would do on Raspberry Pi.</p>
+        <pre id="logs"></pre>
+      </aside>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
