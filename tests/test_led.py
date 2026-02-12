@@ -106,3 +106,37 @@ class TestLedSimulation:
     def test_stripe_off(self) -> None:
         self.led.pixel_fill((255, 0, 0))
         self.led.stripe_off()
+
+    def test_pixel_runtime_failure_disables_neopixel_without_crashing(self) -> None:
+        class FailingPixel:
+            def fill(self, _rgb: tuple[int, int, int]) -> None:
+                raise RuntimeError("NeoPixel support requires running with sudo, please try again!")
+
+        self.led._pixel = FailingPixel()
+        self.led.pixel_fill((12, 34, 56))
+
+        assert self.led._pixel_failure_reason is not None
+        assert "runtime write failed" in self.led._pixel_failure_reason
+
+        # Subsequent writes use no-op pixel backend and should remain stable.
+        self.led.pixel_fill((0, 0, 0))
+
+    def test_pixel_runtime_failure_raises_in_strict_mode(self) -> None:
+        class FailingPixel:
+            def fill(self, _rgb: tuple[int, int, int]) -> None:
+                raise RuntimeError("NeoPixel support requires running with sudo, please try again!")
+
+        os.environ["AIRSOFT_REQUIRE_NEOPIXEL"] = "1"
+        strict_led = Led()
+        strict_led._pixel = FailingPixel()
+
+        try:
+            strict_led.pixel_fill((1, 2, 3))
+            raise AssertionError("Expected strict NeoPixel mode to raise")
+        except RuntimeError:
+            pass
+        finally:
+            strict_led._require_neopixel = False
+            strict_led.stop_all_blinkers()
+            strict_led.turn_off_all()
+            os.environ.pop("AIRSOFT_REQUIRE_NEOPIXEL", None)

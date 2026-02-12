@@ -72,6 +72,7 @@ class Led:
         force_simulation = is_truthy(os.getenv("AIRSOFT_SIMULATE_GPIO"))
         board_missing = isinstance(board, _NoopBoard)
         gpio_missing = isinstance(GPIO, _NoopGPIO)
+        self._require_neopixel = is_truthy(os.getenv("AIRSOFT_REQUIRE_NEOPIXEL"))
 
         self._simulate_gpio = force_simulation or board_missing or gpio_missing
         self._log_gpio = self._simulate_gpio or is_truthy(os.getenv("AIRSOFT_LOG_GPIO"))
@@ -79,6 +80,7 @@ class Led:
 
         self._gpio = _NoopGPIO() if self._simulate_gpio else GPIO
         self._pixel: object = _NoopNeoPixel()
+        self._pixel_failure_reason: Optional[str] = None
 
         self._gpio.setwarnings(False)
         self._gpio.setmode(self._gpio.BCM)
@@ -121,6 +123,29 @@ class Led:
         if self._simulate_gpio:
             self._log(f"Simulation mode active ({self._simulation_reason}).")
             self._log("GPIO and LED operations are printed; no hardware is controlled.")
+
+    def _disable_pixel_output(self, reason: str, exc: Optional[Exception] = None) -> None:
+        if self._pixel_failure_reason is not None:
+            return
+
+        detail = reason if exc is None else f"{reason}: {exc}"
+        self._pixel_failure_reason = detail
+        self._pixel = _NoopNeoPixel()
+        self._log_gpio = True
+        self._log(f"NeoPixel disabled ({detail})")
+
+        if exc is None:
+            logger.warning("NeoPixel disabled: %s", detail)
+        else:
+            logger.warning("NeoPixel disabled: %s", detail, exc_info=True)
+
+    def _safe_pixel_fill(self, color: Tuple[int, int, int]) -> None:
+        try:
+            self._pixel.fill(color)
+        except Exception as exc:
+            if self._require_neopixel:
+                raise
+            self._disable_pixel_output("runtime write failed", exc)
 
     def _build_simulation_reason(
         self, force_simulation: bool, board_missing: bool, gpio_missing: bool
@@ -171,12 +196,12 @@ class Led:
         self._log(f"Pin {self.RED_PIN} (RED) -> OFF")
 
     def stripe_off(self) -> None:
-        self._pixel.fill((0, 0, 0))
+        self._safe_pixel_fill((0, 0, 0))
         self._log("LED stripe -> OFF")
 
     def pixel_fill(self, rgb: Tuple[int, int, int]) -> None:
         color = self._normalize_rgb(rgb)
-        self._pixel.fill(color)
+        self._safe_pixel_fill(color)
         self._stripe_rgb = color
         self._log(f"LED stripe fill -> {color}")
 
@@ -279,7 +304,7 @@ class Led:
         direction = -1
         while not self._stripe_blinker_stop:
             color = tuple(int(channel * intensity) for channel in self._stripe_rgb)
-            self._pixel.fill(color)
+            self._safe_pixel_fill(color)
             time.sleep(self._stripe_interval)
 
             intensity += direction * 0.1
@@ -299,9 +324,9 @@ class Led:
 
     def _stripe_blinker(self) -> None:
         while not self._stripe_blinker_stop:
-            self._pixel.fill(self._stripe_rgb)
+            self._safe_pixel_fill(self._stripe_rgb)
             time.sleep(self._stripe_interval / 2)
-            self._pixel.fill((0, 0, 0))
+            self._safe_pixel_fill((0, 0, 0))
             time.sleep(self._stripe_interval / 2)
 
     def _safe_join(self, thread: Optional[threading.Thread]) -> None:

@@ -6,9 +6,16 @@ SERVICE_NAME="airsoft-suitcase"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GAME_USER="${AIRSOFT_GAME_USER:-${SUDO_USER:-pi}}"
 HOME_DIR="/home/${GAME_USER}"
+GAME_UID=""
+SERVICE_RUN_AS_ROOT="${AIRSOFT_SERVICE_RUN_AS_ROOT:-1}"
+REQUIRE_NEOPIXEL="${AIRSOFT_REQUIRE_NEOPIXEL:-1}"
+SERVICE_USER=""
+SERVICE_GROUP=""
+SERVICE_HOME=""
 VENV_DIR="${HOME_DIR}/.local/share/${APP_NAME}/venv"
 PYTHON_BIN="${VENV_DIR}/bin/python"
 PIP_BIN="${VENV_DIR}/bin/pip"
+RUN_GAME_SCRIPT="${ROOT_DIR}/scripts/run_game.py"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SETUP_READ_ONLY="${AIRSOFT_SETUP_READ_ONLY:-1}"
 REBOOT_NEEDED=0
@@ -32,6 +39,21 @@ require_user() {
   if ! id "${GAME_USER}" >/dev/null 2>&1; then
     fail "User '${GAME_USER}' does not exist."
   fi
+  GAME_UID="$(id -u "${GAME_USER}")"
+}
+
+configure_service_identity() {
+  if [ "${SERVICE_RUN_AS_ROOT}" = "1" ]; then
+    SERVICE_USER="root"
+    SERVICE_GROUP="root"
+    # Keep HOME/XAUTHORITY on the desktop user for display session access.
+    SERVICE_HOME="${HOME_DIR}"
+    return
+  fi
+
+  SERVICE_USER="${GAME_USER}"
+  SERVICE_GROUP="${GAME_USER}"
+  SERVICE_HOME="${HOME_DIR}"
 }
 
 install_dependencies() {
@@ -49,10 +71,45 @@ install_dependencies() {
 
 setup_venv() {
   log "Preparing virtualenv at ${VENV_DIR}"
-  sudo -u "${GAME_USER}" mkdir -p "${VENV_DIR}"
+  if [ -d "${VENV_DIR}" ]; then
+    log "Removing existing virtualenv for clean redeploy"
+    rm -rf "${VENV_DIR}"
+  fi
+  sudo -u "${GAME_USER}" mkdir -p "$(dirname "${VENV_DIR}")"
   sudo -u "${GAME_USER}" python3 -m venv "${VENV_DIR}"
   sudo -u "${GAME_USER}" "${PIP_BIN}" install --upgrade pip setuptools wheel
   sudo -u "${GAME_USER}" "${PIP_BIN}" install --no-cache-dir "${ROOT_DIR}[pi]"
+}
+
+verify_project_files() {
+  if [ ! -f "${RUN_GAME_SCRIPT}" ]; then
+    fail "Launcher script not found: ${RUN_GAME_SCRIPT}"
+  fi
+}
+
+clean_existing_service() {
+  local unit="${SERVICE_NAME}.service"
+  local dropin_dir="${SERVICE_PATH}.d"
+
+  log "Stopping existing service (if running)"
+  systemctl stop "${unit}" >/dev/null 2>&1 || true
+
+  log "Disabling existing service (if enabled)"
+  systemctl disable "${unit}" >/dev/null 2>&1 || true
+
+  systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+
+  if [ -f "${SERVICE_PATH}" ] || [ -L "${SERVICE_PATH}" ]; then
+    log "Removing existing unit file ${SERVICE_PATH}"
+    rm -f "${SERVICE_PATH}"
+  fi
+
+  if [ -d "${dropin_dir}" ]; then
+    log "Removing existing systemd drop-ins ${dropin_dir}"
+    rm -rf "${dropin_dir}"
+  fi
+
+  systemctl daemon-reload
 }
 
 write_unit_file() {
@@ -64,19 +121,21 @@ After=multi-user.target network-online.target graphical.target
 Wants=network-online.target graphical.target
 
 [Service]
-User=${GAME_USER}
-Group=${GAME_USER}
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
 WorkingDirectory=${ROOT_DIR}
-Environment="HOME=${HOME_DIR}"
+Environment="HOME=${SERVICE_HOME}"
 Environment="DISPLAY=:0"
 Environment="XAUTHORITY=${HOME_DIR}/.Xauthority"
+Environment="XDG_RUNTIME_DIR=/run/user/${GAME_UID}"
 Environment="AIRSOFT_NO_BROWSER=1"
 Environment="AIRSOFT_UI=auto"
+Environment="AIRSOFT_REQUIRE_NEOPIXEL=${REQUIRE_NEOPIXEL}"
 Type=simple
 Restart=always
 RestartSec=5
 ExecStartPre=/usr/bin/sleep 5
-ExecStart=${PYTHON_BIN} -m airsoft_suitcase
+ExecStart=${PYTHON_BIN} ${RUN_GAME_SCRIPT}
 StandardOutput=journal
 StandardError=journal
 
@@ -114,7 +173,9 @@ enable_service() {
 summary() {
   log "Setup complete."
   log "Game service: ${SERVICE_NAME}.service"
-  log "Service command: ${PYTHON_BIN} -m airsoft_suitcase"
+  log "Service command: ${PYTHON_BIN} ${RUN_GAME_SCRIPT}"
+  log "Service user: ${SERVICE_USER}"
+  log "Require NeoPixel: ${REQUIRE_NEOPIXEL}"
   if [ "${REBOOT_NEEDED}" -eq 1 ]; then
     log "Reboot to apply read-only overlay mode."
   fi
@@ -123,8 +184,11 @@ summary() {
 main() {
   require_root
   require_user
+  configure_service_identity
   install_dependencies
+  clean_existing_service
   setup_venv
+  verify_project_files
   write_unit_file
   enable_service
   enable_read_only_mode
