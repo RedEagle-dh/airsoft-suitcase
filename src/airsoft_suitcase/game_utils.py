@@ -2,6 +2,7 @@ import csv
 import logging
 import os
 import random
+from contextlib import suppress
 from pathlib import Path
 from typing import Iterable, Optional, Tuple, Union
 
@@ -50,21 +51,31 @@ def initialize_audio() -> bool:
         logger.warning("pygame.init() failed", exc_info=True)
         return False
 
-    try:
-        pygame.mixer.init(devicename="0")
-    except TypeError:
+    configured_device = (os.getenv("AIRSOFT_AUDIO_DEVICE") or "").strip()
+    attempts = []
+    if configured_device:
+        attempts.append({"devicename": configured_device})
+    attempts.append({})
+    attempts.append({"devicename": "default"})
+    attempts.append({"devicename": "0"})
+
+    for kwargs in attempts:
         try:
-            pygame.mixer.init()
-        except Exception:
+            with suppress(Exception):
+                if pygame.mixer.get_init():
+                    pygame.mixer.quit()
+            pygame.mixer.init(**kwargs)
+            return True
+        except TypeError:
+            # Older pygame builds may not support the devicename kwarg.
+            if kwargs:
+                continue
             logger.warning("pygame.mixer.init() failed", exc_info=True)
             return False
-    except Exception:
-        try:
-            pygame.mixer.init()
         except Exception:
-            logger.warning("pygame.mixer.init() failed", exc_info=True)
-            return False
-    return True
+            logger.warning("pygame.mixer.init() attempt failed (%s)", kwargs or "default", exc_info=True)
+
+    return False
 
 
 def play_audio(name: str, enabled: bool) -> None:

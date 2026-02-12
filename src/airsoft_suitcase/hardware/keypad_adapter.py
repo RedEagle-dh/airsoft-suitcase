@@ -46,9 +46,10 @@ def setup_gpio() -> None:
     GPIO.setup(B2_IN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 
-def send_key(key_value: object) -> None:
+def send_key_while_pressed(key_value: object, pin: int) -> None:
     keyboard.press(key_value)
-    time.sleep(0.1)
+    wait_for(pin)
+    time.sleep(0.01)
     keyboard.release(key_value)
 
 
@@ -61,21 +62,17 @@ def wait_for(pin: int) -> None:
 def read_row(line: int, characters: List[str]) -> None:
     GPIO.output(line, GPIO.LOW)
     if GPIO.input(COL_1) == GPIO.LOW:
-        send_key(characters[0])
+        send_key_while_pressed(characters[0], COL_1)
         print(characters[0])
-        wait_for(COL_1)
     if GPIO.input(COL_2) == GPIO.LOW:
-        send_key(characters[1])
+        send_key_while_pressed(characters[1], COL_2)
         print(characters[1])
-        wait_for(COL_2)
     if GPIO.input(COL_3) == GPIO.LOW:
-        send_key(characters[2])
+        send_key_while_pressed(characters[2], COL_3)
         print(characters[2])
-        wait_for(COL_3)
     if GPIO.input(COL_4) == GPIO.LOW:
-        send_key(characters[3])
+        send_key_while_pressed(characters[3], COL_4)
         print(characters[3])
-        wait_for(COL_4)
     GPIO.output(line, GPIO.HIGH)
 
 
@@ -83,15 +80,13 @@ def read_buttons() -> None:
     GPIO.output(B1_OUT, GPIO.LOW)
     if GPIO.input(B1_IN) == GPIO.LOW:
         print("delete")
-        send_key(Key.delete)
-        wait_for(B1_IN)
+        send_key_while_pressed(Key.delete, B1_IN)
     GPIO.output(B1_OUT, GPIO.HIGH)
 
     GPIO.output(B2_OUT, GPIO.LOW)
     if GPIO.input(B2_IN) == GPIO.LOW:
         print("enter")
-        send_key(Key.enter)
-        wait_for(B2_IN)
+        send_key_while_pressed(Key.enter, B2_IN)
     GPIO.output(B2_OUT, GPIO.HIGH)
 
 

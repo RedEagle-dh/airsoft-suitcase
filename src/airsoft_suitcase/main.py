@@ -4,7 +4,7 @@ import random
 import threading
 import tkinter as tk
 from contextlib import suppress
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .game_utils import (
     CONFIG_PATH,
@@ -77,6 +77,13 @@ class LogicWindow:
         # Flag state
         self.flag_team: Optional[str] = None
 
+        # View cache to avoid full widget tear-down on every state tick.
+        self._active_view_key = ""
+        self._menu_widgets: Dict[str, object] = {}
+        self._bomb_widgets: Dict[str, tk.Label] = {}
+        self._bunker_widgets: Dict[str, tk.Label] = {}
+        self._flag_widgets: Dict[str, tk.Label] = {}
+
         self.root = tk.Tk()
         self.root.attributes("-fullscreen", True)
         self.root.focus_force()
@@ -116,6 +123,17 @@ class LogicWindow:
     def clear_frame(self) -> None:
         for child in self.root.winfo_children():
             child.destroy()
+
+    def _switch_view(self, view_key: str) -> bool:
+        if self._active_view_key == view_key:
+            return False
+        self.clear_frame()
+        self._active_view_key = view_key
+        return True
+
+    def _set_label_text(self, label: tk.Label, text: str) -> None:
+        if label.cget("text") != text:
+            label.configure(text=text)
 
     def format_time(self, seconds: int) -> str:
         mins, secs = divmod(max(seconds, 0), 60)
@@ -206,35 +224,45 @@ class LogicWindow:
         self.render_menu()
 
     def render_menu(self) -> None:
-        self.clear_frame()
-
+        rebuilt = self._switch_view(f"menu:{self.menu_level}")
         title = "Spielauswahl:" if self.menu_level == "game" else "Bombe: Schwierigkeit"
         options = self.modes if self.menu_level == "game" else self.bomb_difficulties
 
-        tk.Label(self.root, text=title, bg="black", fg="green", font=("Ubuntu", 50)).pack()
+        if rebuilt:
+            title_label = tk.Label(self.root, bg="black", fg="green", font=("Ubuntu", 50))
+            title_label.pack()
 
-        for idx, option in enumerate(options, start=1):
-            prefix = "<-- " if self.selection == (idx - 1) else "    "
-            tk.Label(
-                self.root,
-                text=f"{prefix}{idx}: {option}",
-                bg="black",
-                fg="green",
-                font=("Ubuntu", 42),
-                anchor="w",
-                justify="left",
-            ).place(x=120, y=100 + (idx * 90))
+            option_labels: List[tk.Label] = []
+            for idx in range(1, 4):
+                option_label = tk.Label(
+                    self.root,
+                    bg="black",
+                    fg="green",
+                    font=("Ubuntu", 42),
+                    anchor="w",
+                    justify="left",
+                )
+                option_label.place(x=120, y=100 + (idx * 90))
+                option_labels.append(option_label)
 
-        tk.Label(self.root, text="Rot: Zurück", fg="green", bg="black", font=("Ubuntu", 30)).place(
-            relx=0.0,
-            rely=1.0,
-            anchor="sw",
-        )
-        tk.Label(self.root, text="Blau: Bestätigen", fg="green", bg="black", font=("Ubuntu", 30)).place(
-            relx=1.0,
-            rely=1.0,
-            anchor="se",
-        )
+            red_label = tk.Label(self.root, text="Rot: Zurück", fg="green", bg="black", font=("Ubuntu", 30))
+            red_label.place(relx=0.0, rely=1.0, anchor="sw")
+
+            blue_label = tk.Label(self.root, text="Blau: Bestätigen", fg="green", bg="black", font=("Ubuntu", 30))
+            blue_label.place(relx=1.0, rely=1.0, anchor="se")
+
+            self._menu_widgets = {
+                "title": title_label,
+                "options": option_labels,
+            }
+
+        title_label = self._menu_widgets["title"]
+        option_labels = self._menu_widgets["options"]
+        self._set_label_text(title_label, title)  # type: ignore[arg-type]
+
+        for idx, option in enumerate(options):
+            prefix = "<-- " if self.selection == idx else "    "
+            self._set_label_text(option_labels[idx], f"{prefix}{idx + 1}: {option}")  # type: ignore[index]
 
     # ----------------------------
     # Key handling
@@ -596,87 +624,111 @@ class LogicWindow:
         self.render_bomb()
 
     def render_bomb(self) -> None:
-        self.clear_frame()
+        rebuilt = self._switch_view(f"bomb:{self.bomb_stage}")
 
-        tk.Label(self.root, fg="green", bg="black", text="Bombe", font=("Ubuntu", 50)).pack()
-        tk.Label(
-            self.root,
-            fg="green",
-            bg="black",
-            text=f"Zeit: {self.format_time(self.bomb_remaining)}",
-            font=("Ubuntu", 44),
-        ).pack()
+        if rebuilt:
+            self._bomb_widgets = {}
 
-        if self.bomb_stage == "await_nfc":
-            tk.Label(
-                self.root,
-                fg="green",
-                bg="black",
-                text="Schwer-Modus: NFC-Karte scannen",
-                font=("Ubuntu", 30),
-            ).pack(pady=20)
-            tk.Label(
-                self.root,
-                fg="green",
-                bg="black",
-                text="Simulation: Taste A",
-                font=("Ubuntu", 20),
-            ).pack()
-            tk.Label(
-                self.root,
-                fg="green",
-                bg="black",
-                text="# 3s halten = Hauptmenü",
-                font=("Ubuntu", 20),
-            ).pack(pady=12)
-            return
+            self._bomb_widgets["title"] = tk.Label(self.root, fg="green", bg="black", text="Bombe", font=("Ubuntu", 50))
+            self._bomb_widgets["title"].pack()
+
+            self._bomb_widgets["timer"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 44))
+            self._bomb_widgets["timer"].pack()
+
+            if self.bomb_stage == "await_nfc":
+                self._bomb_widgets["line1"] = tk.Label(
+                    self.root,
+                    fg="green",
+                    bg="black",
+                    text="Schwer-Modus: NFC-Karte scannen",
+                    font=("Ubuntu", 30),
+                )
+                self._bomb_widgets["line1"].pack(pady=20)
+                self._bomb_widgets["line2"] = tk.Label(
+                    self.root,
+                    fg="green",
+                    bg="black",
+                    text="Simulation: Taste A",
+                    font=("Ubuntu", 20),
+                )
+                self._bomb_widgets["line2"].pack()
+                self._bomb_widgets["hint"] = tk.Label(
+                    self.root,
+                    fg="green",
+                    bg="black",
+                    text="# 3s halten = Hauptmenü",
+                    font=("Ubuntu", 20),
+                )
+                self._bomb_widgets["hint"].pack(pady=12)
+            elif self.bomb_stage in {"await_code", "await_reentry"}:
+                self._bomb_widgets["prompt"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 28))
+                self._bomb_widgets["prompt"].pack(pady=8)
+                self._bomb_widgets["code"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 17))
+                self._bomb_widgets["code"].pack()
+                self._bomb_widgets["input"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 32))
+                self._bomb_widgets["input"].pack(pady=16)
+                self._bomb_widgets["attempts"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 24))
+                self._bomb_widgets["attempts"].pack()
+                self._bomb_widgets["hint"] = tk.Label(
+                    self.root,
+                    fg="green",
+                    bg="black",
+                    text="# 3s halten = Hauptmenü",
+                    font=("Ubuntu", 18),
+                )
+                self._bomb_widgets["hint"].pack(pady=10)
+            elif self.bomb_stage == "locked":
+                self._bomb_widgets["locked"] = tk.Label(self.root, fg="red", bg="black", font=("Ubuntu", 44))
+                self._bomb_widgets["locked"].pack(pady=40)
+                self._bomb_widgets["hint"] = tk.Label(
+                    self.root,
+                    fg="red",
+                    bg="black",
+                    text="# 3s halten = Hauptmenü",
+                    font=("Ubuntu", 18),
+                )
+                self._bomb_widgets["hint"].pack()
+            elif self.bomb_stage == "countdown":
+                self._bomb_widgets["status"] = tk.Label(
+                    self.root,
+                    fg="green",
+                    bg="black",
+                    text="Countdown läuft",
+                    font=("Ubuntu", 34),
+                )
+                self._bomb_widgets["status"].pack(pady=40)
+                self._bomb_widgets["hint"] = tk.Label(
+                    self.root,
+                    fg="green",
+                    bg="black",
+                    text="# 3s halten = Hauptmenü",
+                    font=("Ubuntu", 20),
+                )
+                self._bomb_widgets["hint"].pack()
+            elif self.bomb_stage == "ended":
+                self._bomb_widgets["ended"] = tk.Label(self.root, fg="red", bg="black", font=("Ubuntu", 34))
+                self._bomb_widgets["ended"].pack(pady=40)
+                self._bomb_widgets["back"] = tk.Label(
+                    self.root,
+                    fg="green",
+                    bg="black",
+                    text="Rückkehr zum Hauptmenü...",
+                    font=("Ubuntu", 22),
+                )
+                self._bomb_widgets["back"].pack()
+
+        self._set_label_text(self._bomb_widgets["timer"], f"Zeit: {self.format_time(self.bomb_remaining)}")
 
         if self.bomb_stage in {"await_code", "await_reentry"}:
             prompt = "Code zum Start:" if self.bomb_stage == "await_code" else "Neuer Code erforderlich:"
-            tk.Label(self.root, fg="green", bg="black", text=prompt, font=("Ubuntu", 28)).pack(pady=8)
-            tk.Label(self.root, fg="green", bg="black", text=self.bomb_expected_code, font=("Ubuntu", 17)).pack()
-            tk.Label(
-                self.root,
-                fg="green",
-                bg="black",
-                text=f"Eingabe: {''.join(self.bomb_input)}",
-                font=("Ubuntu", 32),
-            ).pack(pady=16)
-            tk.Label(
-                self.root,
-                fg="green",
-                bg="black",
-                text=f"Fehlversuche: {self.bomb_attempt}/3",
-                font=("Ubuntu", 24),
-            ).pack()
-            tk.Label(
-                self.root,
-                fg="green",
-                bg="black",
-                text="# 3s halten = Hauptmenü",
-                font=("Ubuntu", 18),
-            ).pack(pady=10)
-            return
-
-        if self.bomb_stage == "locked":
-            tk.Label(
-                self.root,
-                fg="red",
-                bg="black",
-                text=f"Eingabe gesperrt: {self.bomb_lock_remaining}s",
-                font=("Ubuntu", 44),
-            ).pack(pady=40)
-            tk.Label(self.root, fg="red", bg="black", text="# 3s halten = Hauptmenü", font=("Ubuntu", 18)).pack()
-            return
-
-        if self.bomb_stage == "countdown":
-            tk.Label(self.root, fg="green", bg="black", text="Countdown läuft", font=("Ubuntu", 34)).pack(pady=40)
-            tk.Label(self.root, fg="green", bg="black", text="# 3s halten = Hauptmenü", font=("Ubuntu", 20)).pack()
-            return
-
-        if self.bomb_stage == "ended":
-            tk.Label(self.root, fg="red", bg="black", text=self.bomb_end_message, font=("Ubuntu", 34)).pack(pady=40)
-            tk.Label(self.root, fg="green", bg="black", text="Rückkehr zum Hauptmenü...", font=("Ubuntu", 22)).pack()
+            self._set_label_text(self._bomb_widgets["prompt"], prompt)
+            self._set_label_text(self._bomb_widgets["code"], self.bomb_expected_code)
+            self._set_label_text(self._bomb_widgets["input"], f"Eingabe: {''.join(self.bomb_input)}")
+            self._set_label_text(self._bomb_widgets["attempts"], f"Fehlversuche: {self.bomb_attempt}/3")
+        elif self.bomb_stage == "locked":
+            self._set_label_text(self._bomb_widgets["locked"], f"Eingabe gesperrt: {self.bomb_lock_remaining}s")
+        elif self.bomb_stage == "ended":
+            self._set_label_text(self._bomb_widgets["ended"], self.bomb_end_message)
 
     # ----------------------------
     # Bunker mode
@@ -779,44 +831,45 @@ class LogicWindow:
             self._set_bunker_team("blue")
 
     def render_bunker(self) -> None:
-        self.clear_frame()
+        rebuilt = self._switch_view("bunker")
 
-        tk.Label(self.root, fg="green", bg="black", text="Bunker", font=("Ubuntu", 52)).pack()
+        if rebuilt:
+            self._bunker_widgets = {}
+            self._bunker_widgets["title"] = tk.Label(self.root, fg="green", bg="black", text="Bunker", font=("Ubuntu", 52))
+            self._bunker_widgets["title"].pack()
+            self._bunker_widgets["status"] = tk.Label(self.root, fg="green", bg="black")
+            self._bunker_widgets["status"].pack(pady=16)
+            self._bunker_widgets["times"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 24))
+            self._bunker_widgets["times"].pack(pady=8)
+            self._bunker_widgets["footer"] = tk.Label(self.root, bg="black")
+            self._bunker_widgets["footer"].pack(pady=12)
 
+        status_label = self._bunker_widgets["status"]
         if self.bunker_active_team is None:
-            tk.Label(self.root, fg="green", bg="black", text="Warte auf Team...", font=("Ubuntu", 34)).pack(pady=20)
+            status_text = "Warte auf Team..."
+            status_label.configure(font=("Ubuntu", 34), fg="green")
         else:
             active_seconds = self.bunker_blue_seconds if self.bunker_active_team == "blue" else self.bunker_red_seconds
             active_color = "BLUE" if self.bunker_active_team == "blue" else "RED"
-            tk.Label(
-                self.root,
-                fg="green",
-                bg="black",
-                text=f"{active_color} {self.format_time(active_seconds)}",
-                font=("Ubuntu", 76),
-            ).pack(pady=16)
+            status_text = f"{active_color} {self.format_time(active_seconds)}"
+            status_label.configure(font=("Ubuntu", 76), fg="green")
+        self._set_label_text(status_label, status_text)
 
-        times_text = (
-            f"Blue: {self.format_time(self.bunker_blue_seconds)}   "
-            f"Red: {self.format_time(self.bunker_red_seconds)}"
-        )
-        tk.Label(self.root, fg="green", bg="black", text=times_text, font=("Ubuntu", 24)).pack(pady=8)
+        times_text = f"Blue: {self.format_time(self.bunker_blue_seconds)}   Red: {self.format_time(self.bunker_red_seconds)}"
+        self._set_label_text(self._bunker_widgets["times"], times_text)
 
+        footer_label = self._bunker_widgets["footer"]
         if self.bunker_winner is None:
-            tk.Label(
-                self.root,
-                fg="green",
-                bg="black",
-                text=f"Ziel: {self.BUNKER_TARGET_SECONDS}s | # 3s halten = Hauptmenü",
-                font=("Ubuntu", 18),
-            ).pack(pady=12)
+            footer_label.configure(font=("Ubuntu", 18), fg="green")
+            self._set_label_text(footer_label, f"Ziel: {self.BUNKER_TARGET_SECONDS}s | # 3s halten = Hauptmenü")
         else:
             winner_label = "BLUE" if self.bunker_winner == "blue" else "RED"
+            footer_label.configure(font=("Ubuntu", 24), fg="red")
             if self.bunker_signal_active:
-                text = f"{winner_label} gewonnen - Signal aktiv"  # solange * gehalten wird
+                footer_text = f"{winner_label} gewonnen - Signal aktiv"
             else:
-                text = f"{winner_label} bei 600s - * gedrückt halten zum Beenden"
-            tk.Label(self.root, fg="red", bg="black", text=text, font=("Ubuntu", 24)).pack(pady=12)
+                footer_text = f"{winner_label} bei 600s - * gedrückt halten zum Beenden"
+            self._set_label_text(footer_label, footer_text)
 
     # ----------------------------
     # Flag mode
@@ -859,18 +912,29 @@ class LogicWindow:
             self._set_flag_team("blue")
 
     def render_flag(self) -> None:
-        self.clear_frame()
+        rebuilt = self._switch_view("flag")
 
-        tk.Label(self.root, fg="green", bg="black", text="Flagge", font=("Ubuntu", 52)).pack(pady=10)
+        if rebuilt:
+            self._flag_widgets = {}
+            self._flag_widgets["title"] = tk.Label(self.root, fg="green", bg="black", text="Flagge", font=("Ubuntu", 52))
+            self._flag_widgets["title"].pack(pady=10)
+            self._flag_widgets["team"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 140))
+            self._flag_widgets["team"].pack(pady=30)
+            self._flag_widgets["hint"] = tk.Label(
+                self.root,
+                fg="green",
+                bg="black",
+                text="# 3s halten = Hauptmenü",
+                font=("Ubuntu", 22),
+            )
+            self._flag_widgets["hint"].pack()
 
         label = "-"
         if self.flag_team == "red":
             label = "ROT"
         elif self.flag_team == "blue":
             label = "BLAU"
-
-        tk.Label(self.root, fg="green", bg="black", text=label, font=("Ubuntu", 140)).pack(pady=30)
-        tk.Label(self.root, fg="green", bg="black", text="# 3s halten = Hauptmenü", font=("Ubuntu", 22)).pack()
+        self._set_label_text(self._flag_widgets["team"], label)
 
 
 def main() -> None:

@@ -10,6 +10,7 @@ HOME_DIR="/home/${GAME_USER}"
 GAME_UID=""
 SERVICE_RUN_AS_ROOT="${AIRSOFT_SERVICE_RUN_AS_ROOT:-1}"
 REQUIRE_NEOPIXEL="${AIRSOFT_REQUIRE_NEOPIXEL:-1}"
+AUDIO_DEVICE="${AIRSOFT_AUDIO_DEVICE:-}"
 SERVICE_USER=""
 SERVICE_GROUP=""
 SERVICE_HOME=""
@@ -50,9 +51,8 @@ configure_service_identity() {
   if [ "${SERVICE_RUN_AS_ROOT}" = "1" ]; then
     SERVICE_USER="root"
     SERVICE_GROUP="root"
-    # Keep HOME/XAUTHORITY on the desktop user for display session access.
-    SERVICE_HOME="${HOME_DIR}"
-    XDG_ENV_LINE=""
+    SERVICE_HOME="/root"
+    XDG_ENV_LINE="Environment=\"XDG_RUNTIME_DIR=/tmp\""
     return
   fi
 
@@ -146,9 +146,12 @@ ${XDG_ENV_LINE}
 Environment="AIRSOFT_NO_BROWSER=1"
 Environment="AIRSOFT_UI=auto"
 Environment="AIRSOFT_REQUIRE_NEOPIXEL=${REQUIRE_NEOPIXEL}"
+Environment="AIRSOFT_AUDIO_DEVICE=${AUDIO_DEVICE}"
+Environment="SDL_AUDIODRIVER=alsa"
 Type=simple
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
 ExecStartPre=/usr/bin/sleep 5
 ExecStart=${PYTHON_BIN} ${RUN_GAME_SCRIPT}
 StandardOutput=journal
@@ -181,6 +184,7 @@ ${XDG_ENV_LINE}
 Type=simple
 Restart=always
 RestartSec=2
+TimeoutStopSec=10
 ExecStartPre=/usr/bin/sleep 2
 ExecStart=${PYTHON_BIN} ${RUN_KEYPAD_SCRIPT}
 StandardOutput=journal
@@ -225,6 +229,7 @@ summary() {
   log "Keypad command: ${PYTHON_BIN} ${RUN_KEYPAD_SCRIPT}"
   log "Service user: ${SERVICE_USER}"
   log "Require NeoPixel: ${REQUIRE_NEOPIXEL}"
+  log "Audio device: ${AUDIO_DEVICE:-auto}"
   if [ "${REBOOT_NEEDED}" -eq 1 ]; then
     log "Reboot to apply read-only overlay mode."
   fi
