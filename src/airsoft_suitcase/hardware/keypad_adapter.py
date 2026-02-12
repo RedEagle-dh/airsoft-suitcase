@@ -24,6 +24,8 @@ COL_2 = 17
 COL_3 = 27
 COL_4 = 22
 
+HASH_HOLD_SECONDS = 3.0
+
 
 def setup_gpio() -> None:
     GPIO.setwarnings(False)
@@ -44,6 +46,12 @@ def setup_gpio() -> None:
     GPIO.setup(COL_4, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(B1_IN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(B2_IN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+
+def send_key(key_value: object) -> None:
+    keyboard.press(key_value)
+    time.sleep(0.1)
+    keyboard.release(key_value)
 
 
 def send_key_while_pressed(key_value: object, pin: int) -> None:
@@ -68,8 +76,21 @@ def read_row(line: int, characters: List[str]) -> None:
         send_key_while_pressed(characters[1], COL_2)
         print(characters[1])
     if GPIO.input(COL_3) == GPIO.LOW:
-        send_key_while_pressed(characters[2], COL_3)
-        print(characters[2])
+        if characters[2] == "#":
+            start = time.monotonic()
+            while GPIO.input(COL_3) == GPIO.LOW:
+                if (time.monotonic() - start) >= HASH_HOLD_SECONDS:
+                    print("hash-hold -> escape")
+                    send_key(Key.esc)
+                    wait_for(COL_3)
+                    break
+                time.sleep(0.01)
+            else:
+                send_key_while_pressed(characters[2], COL_3)
+                print(characters[2])
+        else:
+            send_key_while_pressed(characters[2], COL_3)
+            print(characters[2])
     if GPIO.input(COL_4) == GPIO.LOW:
         send_key_while_pressed(characters[3], COL_4)
         print(characters[3])

@@ -273,6 +273,10 @@ class LogicWindow:
             return
         self.pressed_keys.append(key.keysym)
 
+        if self.is_in_game and key.keysym == "Escape":
+            self.reset_to_menu()
+            return
+
         if self._is_hash_key(key):
             self.hash_key_down = True
             if self.is_in_game:

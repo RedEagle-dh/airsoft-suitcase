@@ -72,7 +72,8 @@ install_dependencies() {
     python3-tk \
     python3-dev \
     git \
-    alsa-utils
+    alsa-utils \
+    mpg123
 }
 
 setup_venv() {
