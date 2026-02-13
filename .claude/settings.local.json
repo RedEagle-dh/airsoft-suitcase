@@ -1,7 +1,39 @@
 {
   "permissions": {
     "allow": [
-      "Bash(.venv/bin/pip install:*)"
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(systemctl status:*)",
+      "Bash(journalctl:*)",
+      "Bash(amixer:*)",
+      "Bash(dpkg:*)",
+      "Bash(pip list:*)",
+      "Bash(sudo tee:*)",
+      "Bash(/dev/null << 'EOF'\npcm.!default {\n    type hw\n    card 2\n}\nctl.!default {\n    type hw\n    card 2\n}\nEOF)",
+      "Bash(sudo apt-get:*)",
+      "Bash(/home/dave/.local/share/airsoft-suitcase/venv/bin/pip install pyscard)",
+      "Bash(sudo systemctl:*)",
+      "Bash(sudo systemctl start:*)",
+      "Bash(timeout 3 /home/dave/.local/share/airsoft-suitcase/venv/bin/python:*)",
+      "Bash(sudo /home/dave/.local/share/airsoft-suitcase/venv/bin/python:*)",
+      "Bash(/home/dave/.local/share/airsoft-suitcase/venv/bin/ruff check:*)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(/home/dave/.local/share/airsoft-suitcase/venv/bin/pip install:*)",
+      "Bash(/home/dave/.local/share/airsoft-suitcase/venv/bin/ruff format:*)",
+      "Bash(AIRSOFT_SIMULATE_GPIO=1 /home/dave/.local/share/airsoft-suitcase/venv/bin/pytest:*)",
+      "Bash(sudo sed:*)",
+      "Bash(fc-list:*)",
+      "Bash(python3:*)",
+      "Bash(sudo AIRSOFT_SIMULATE_GPIO=1 /home/dave/.local/share/airsoft-suitcase/venv/bin/python -c \"\nimport pygame\npygame.init\\(\\)\npygame.mixer.init\\(\\)\nprint\\(''Mixer init:'', pygame.mixer.get_init\\(\\)\\)\npygame.mixer.music.load\\(''/home/dave/airsoft-suitcase/assets/audio/boom.mp3''\\)\npygame.mixer.music.play\\(\\)\nimport time; time.sleep\\(3\\)\nprint\\(''Done''\\)\n\")",
+      "Bash(sudo aplay:*)",
+      "Bash(sudo speaker-test:*)",
+      "Bash(sudo amixer:*)",
+      "Bash(sudo SDL_AUDIODRIVER=alsa AUDIODEV=hw:2,0 /home/dave/.local/share/airsoft-suitcase/venv/bin/python:*)",
+      "Bash(sudo mpg123:*)",
+      "Bash(/dev/null << 'EOF'\npcm.!default {\n    type plug\n    slave.pcm \"hw:2,0\"\n}\nctl.!default {\n    type hw\n    card 2\n}\nEOF)",
+      "Bash(sudo PULSE_SERVER=unix:/run/user/1000/pulse/native XDG_RUNTIME_DIR=/run/user/1000 paplay:*)",
+      "Bash(sudo PULSE_SERVER=unix:/run/user/1000/pulse/native mpg123:*)",
+      "Bash(sudo rm:*)"
     ]
   }
 }

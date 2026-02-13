@@ -16,6 +16,32 @@ from .game_utils import (
     read_audio_setting,
 )
 from .hardware.led import Led
+from .hardware.nfc_reader import NfcReader
+from .theme import (
+    BG_PANEL,
+    BG_PRIMARY,
+    BG_SCREEN,
+    BORDER_COLOR,
+    FONT_BODY,
+    FONT_CODE,
+    FONT_FLAG_TEAM,
+    FONT_FOOTER,
+    FONT_HINT,
+    FONT_INPUT,
+    FONT_MENU_OPTION,
+    FONT_SUBTITLE,
+    FONT_TIMER,
+    FONT_TIMER_LARGE,
+    FOOTER_BAR_HEIGHT,
+    HEADER_BAR_HEIGHT,
+    OUTER_PAD,
+    PANEL_BORDER_WIDTH,
+    PANEL_PADX,
+    TEXT_ALERT,
+    TEXT_DIM,
+    TEXT_HEADER,
+    TEXT_PRIMARY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +58,7 @@ class LogicWindow:
     def __init__(self, use_audio: bool) -> None:
         self.use_audio = bool(use_audio and initialize_audio())
         self.led = Led()
+        self.nfc = NfcReader()
 
         self.modes = ["Bombe", "Bunker", "Flagge"]
         self.bomb_difficulties = ["Einfach", "Mittel", "Schwer"]
@@ -59,6 +86,8 @@ class LogicWindow:
         # Bomb state
         self.bomb_stage = "idle"
         self.bomb_expected_code = ""
+        self.bomb_defuse_code = ""
+        self._beep_suppressed = False
         self.bomb_input: List[str] = []
         self.bomb_remaining = self.BOMB_DURATION_SECONDS
         self.bomb_reentry_targets: List[int] = []
@@ -85,13 +114,15 @@ class LogicWindow:
         self._flag_widgets: Dict[str, tk.Label] = {}
 
         self.root = tk.Tk()
+        self.root.title("Foxys Bombe")
+        self.root.geometry("800x480+0+0")
         self.root.attributes("-fullscreen", True)
+        self.root.attributes("-topmost", True)
+        self.root.configure(background=BG_PRIMARY, cursor="none")
         self.root.focus_force()
         self.root.bind("<KeyPress>", self.keydown)
         self.root.bind("<KeyRelease>", self.keyup)
-        self.root.title("Foxys Bombe")
-        self.root.geometry("800x480")
-        self.root.configure(background="black")
+        self.root.bind("<FocusOut>", lambda _: self.root.after(100, self.root.focus_force))
 
         self.reset_to_menu()
         self.root.mainloop()
@@ -143,8 +174,7 @@ class LogicWindow:
         threading.Thread(target=play_audio, args=(name, self.use_audio), daemon=True).start()
 
     def _beep_once(self) -> None:
-        with suppress(Exception):
-            self.root.bell()
+        self.play_audio_async("beep")
 
     def _extract_keypad_char(self, key: "tk.Event[tk.Misc]") -> str:
         char = (getattr(key, "char", "") or "").upper()
@@ -153,7 +183,7 @@ class LogicWindow:
 
         if key.keysym in {"numbersign", "KP_Hash"}:
             return "#"
-        if key.keysym in {"asterisk", "KP_Multiply"}:
+        if key.keysym in {"asterisk", "KP_Multiply", "parenleft"} or char == "(":
             return "*"
 
         if key.keysym in VALID_KEYS:
@@ -180,11 +210,58 @@ class LogicWindow:
         return None
 
     # ----------------------------
+    # Layout helpers (tactical panel structure)
+    # ----------------------------
+
+    def _create_layout(self) -> tuple:
+        """Create the three-zone tactical layout. Returns (header, content, footer)."""
+        outer = tk.Frame(self.root, bg=BORDER_COLOR, padx=PANEL_BORDER_WIDTH, pady=PANEL_BORDER_WIDTH)
+        outer.pack(fill="both", expand=True, padx=OUTER_PAD, pady=OUTER_PAD)
+
+        header = tk.Frame(outer, bg=BG_PANEL, height=HEADER_BAR_HEIGHT)
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)
+
+        tk.Frame(outer, bg=BORDER_COLOR, height=1).pack(fill="x")
+
+        content = tk.Frame(outer, bg=BG_SCREEN)
+        content.pack(fill="both", expand=True)
+
+        tk.Frame(outer, bg=BORDER_COLOR, height=1).pack(fill="x", side="bottom")
+
+        footer = tk.Frame(outer, bg=BG_PANEL, height=FOOTER_BAR_HEIGHT)
+        footer.pack(fill="x", side="bottom")
+        footer.pack_propagate(False)
+
+        return header, content, footer
+
+    def _add_header_title(self, header: tk.Frame, title: str) -> tk.Label:
+        """Add a left-aligned title label to the header bar."""
+        label = tk.Label(header, text=title, fg=TEXT_HEADER, bg=BG_PANEL, font=FONT_SUBTITLE, anchor="w")
+        label.pack(side="left", padx=PANEL_PADX, fill="y")
+        return label
+
+    def _add_header_status(self, header: tk.Frame, text: str = "") -> tk.Label:
+        """Add a right-aligned status label to the header bar."""
+        label = tk.Label(header, text=text, fg=TEXT_PRIMARY, bg=BG_PANEL, font=FONT_FOOTER, anchor="e")
+        label.pack(side="right", padx=PANEL_PADX, fill="y")
+        return label
+
+    def _add_footer_hints(self, footer: tk.Frame, left: str = "", right: str = "") -> tuple:
+        """Add left/right hint labels to the footer bar. Returns (left_label, right_label)."""
+        left_label = tk.Label(footer, text=left, fg=TEXT_DIM, bg=BG_PANEL, font=FONT_HINT, anchor="w")
+        left_label.pack(side="left", padx=PANEL_PADX, fill="y")
+        right_label = tk.Label(footer, text=right, fg=TEXT_DIM, bg=BG_PANEL, font=FONT_HINT, anchor="e")
+        right_label.pack(side="right", padx=PANEL_PADX, fill="y")
+        return left_label, right_label
+
+    # ----------------------------
     # Global reset/menu
     # ----------------------------
 
     def reset_to_menu(self) -> None:
         self._cancel_all_jobs()
+        self.nfc.stop_polling()
 
         self.pressed_keys = []
         self.hash_key_down = False
@@ -199,6 +276,7 @@ class LogicWindow:
 
         self.bomb_stage = "idle"
         self.bomb_expected_code = ""
+        self.bomb_defuse_code = ""
         self.bomb_input = []
         self.bomb_remaining = self.BOMB_DURATION_SECONDS
         self.bomb_reentry_targets = []
@@ -225,31 +303,20 @@ class LogicWindow:
 
     def render_menu(self) -> None:
         rebuilt = self._switch_view(f"menu:{self.menu_level}")
-        title = "Spielauswahl:" if self.menu_level == "game" else "Bombe: Schwierigkeit"
+        title = "SPIELAUSWAHL" if self.menu_level == "game" else "BOMBE: SCHWIERIGKEIT"
         options = self.modes if self.menu_level == "game" else self.bomb_difficulties
 
         if rebuilt:
-            title_label = tk.Label(self.root, bg="black", fg="green", font=("Ubuntu", 50))
-            title_label.pack()
+            header, content, footer = self._create_layout()
+            title_label = self._add_header_title(header, title)
 
             option_labels: List[tk.Label] = []
-            for idx in range(1, 4):
-                option_label = tk.Label(
-                    self.root,
-                    bg="black",
-                    fg="green",
-                    font=("Ubuntu", 42),
-                    anchor="w",
-                    justify="left",
-                )
-                option_label.place(x=120, y=100 + (idx * 90))
-                option_labels.append(option_label)
+            for _ in range(3):
+                opt = tk.Label(content, bg=BG_SCREEN, fg=TEXT_PRIMARY, font=FONT_MENU_OPTION, anchor="w")
+                opt.pack(padx=80, pady=(18, 0), anchor="w")
+                option_labels.append(opt)
 
-            red_label = tk.Label(self.root, text="Rot: Zurück", fg="green", bg="black", font=("Ubuntu", 30))
-            red_label.place(relx=0.0, rely=1.0, anchor="sw")
-
-            blue_label = tk.Label(self.root, text="Blau: Bestätigen", fg="green", bg="black", font=("Ubuntu", 30))
-            blue_label.place(relx=1.0, rely=1.0, anchor="se")
+            self._add_footer_hints(footer, left="Rot: Zurück", right="Blau: Bestätigen")
 
             self._menu_widgets = {
                 "title": title_label,
@@ -261,7 +328,7 @@ class LogicWindow:
         self._set_label_text(title_label, title)  # type: ignore[arg-type]
 
         for idx, option in enumerate(options):
-            prefix = "<-- " if self.selection == idx else "    "
+            prefix = "> " if self.selection == idx else "  "
             self._set_label_text(option_labels[idx], f"{prefix}{idx + 1}: {option}")  # type: ignore[index]
 
     # ----------------------------
@@ -385,6 +452,7 @@ class LogicWindow:
             self.bomb_stage = "await_code"
 
         self.bomb_expected_code = generate_code(self.BOMB_CODE_LENGTH)
+        self.bomb_defuse_code = generate_code(self.BOMB_CODE_LENGTH)
         self.bomb_input = []
         self.bomb_remaining = self.BOMB_DURATION_SECONDS
         self.bomb_reentry_targets = self._build_reentry_targets(diff)
@@ -393,15 +461,37 @@ class LogicWindow:
         self.bomb_resume_stage = ""
         self.bomb_end_message = ""
 
+        if self.bomb_stage == "await_nfc":
+            self._start_nfc_polling()
+
         self._prepare_bomb_idle_leds()
         self.render_bomb()
 
+    def _start_nfc_polling(self) -> None:
+        """Begin polling the NFC reader; advances to await_code when a card is detected."""
+        self.nfc.start_polling(lambda: self.root.after(0, self._on_nfc_card_detected))
+
+    def _on_nfc_card_detected(self) -> None:
+        """Called on the Tk main thread when a card is scanned."""
+        if self.bomb_stage != "await_nfc":
+            return
+        logger.info("NFC card accepted – advancing to code entry")
+        self.bomb_stage = "await_code"
+        self.bomb_input = []
+        self.bomb_attempt = 0
+        self.render_bomb()
+
+    # Skip targets for dev testing: 7:10, 4:10, 1:10, 0:10
+    _BOMB_SKIP_TARGETS = [430, 250, 70, 10]
+
     def _bomb_blue_interval(self) -> float:
         if self.bomb_remaining <= 60:
-            return 0.20
-        if self.bomb_remaining <= 300:
-            return 0.45
-        return 0.85
+            return 0.25
+        if self.bomb_remaining <= 240:
+            return 0.333
+        if self.bomb_remaining <= 420:
+            return 0.50
+        return 1.0
 
     def _bomb_tank_interval(self) -> float:
         if self.bomb_remaining <= 60:
@@ -410,12 +500,28 @@ class LogicWindow:
             return 0.10
         return 0.16
 
-    def _bomb_beep_interval_ms(self) -> int:
+    def _bomb_beeps_per_second(self) -> int:
         if self.bomb_remaining <= 60:
-            return 180
-        if self.bomb_remaining <= 300:
-            return 340
-        return 650
+            return 4
+        if self.bomb_remaining <= 240:
+            return 3
+        if self.bomb_remaining <= 420:
+            return 2
+        return 1
+
+    def _fire_synced_beeps(self) -> None:
+        """Fire beeps for the current second, synced to the timer tick."""
+        if self._beep_suppressed:
+            return
+        count = self._bomb_beeps_per_second()
+        self._beep_once()
+        if count > 1:
+            interval = 1000 // count
+            for i in range(1, count):
+                self.root.after(interval * i, self._beep_once)
+
+    def _end_beep_suppression(self) -> None:
+        self._beep_suppressed = False
 
     def _prepare_bomb_idle_leds(self) -> None:
         self.led.stop_all_blinkers()
@@ -459,20 +565,11 @@ class LogicWindow:
             return
 
         self._update_bomb_countdown_leds()
+        self._fire_synced_beeps()
         self.render_bomb()
         self._schedule_bomb_tick()
 
-    def _schedule_bomb_beep(self) -> None:
-        if self.bomb_beep_job is not None:
-            return
-        self.bomb_beep_job = self.root.after(self._bomb_beep_interval_ms(), self._tick_bomb_beep)
-
-    def _tick_bomb_beep(self) -> None:
-        self.bomb_beep_job = None
-        if self.phase != "bomb" or self.bomb_stage != "countdown":
-            return
-        self._beep_once()
-        self._schedule_bomb_beep()
+    _ARM_SOUND_DURATION_MS = 2600
 
     def _start_bomb_countdown(self, play_arm_sound: bool) -> None:
         self.bomb_stage = "countdown"
@@ -480,11 +577,14 @@ class LogicWindow:
 
         if play_arm_sound:
             self.play_audio_async("Arm")
+            self._beep_suppressed = True
+            self.root.after(self._ARM_SOUND_DURATION_MS, self._end_beep_suppression)
+        else:
+            self._beep_suppressed = False
 
         self._prepare_bomb_countdown_leds()
         self.render_bomb()
         self._schedule_bomb_tick()
-        self._schedule_bomb_beep()
 
     def _pause_bomb_for_reentry(self) -> None:
         self._cancel_job("bomb_tick_job")
@@ -525,9 +625,15 @@ class LogicWindow:
         if self.bomb_lock_remaining <= 0:
             self.bomb_stage = self.bomb_resume_stage or "await_code"
             self.bomb_resume_stage = ""
+            self.bomb_input = []
             self.led.stop_red_blinker()
-            self._prepare_bomb_idle_leds()
-            self.render_bomb()
+            if self.bomb_stage == "countdown":
+                self._prepare_bomb_countdown_leds()
+                self.render_bomb()
+                self._schedule_bomb_tick()
+            else:
+                self._prepare_bomb_idle_leds()
+                self.render_bomb()
             return
 
         self.render_bomb()
@@ -556,7 +662,6 @@ class LogicWindow:
 
         self.play_audio_async("Defuse")
         self.render_bomb()
-        self.game_end_job = self.root.after(3000, self.reset_to_menu)
 
     def _finish_bomb_timer_elapsed(self) -> None:
         self.bomb_stage = "ended"
@@ -571,12 +676,44 @@ class LogicWindow:
         self.led.turn_red_on()
         self.led.pixel_fill((255, 0, 0))
 
-        self.play_audio_async("Boom")
+        self.play_audio_async("Arm")
+        self.root.after(self._ARM_SOUND_DURATION_MS, lambda: self.play_audio_async("Boom"))
         self.render_bomb()
-        self.game_end_job = self.root.after(3000, self.reset_to_menu)
+
+    def _dev_skip_bomb_timer(self) -> None:
+        """Dev helper: skip countdown to the next phase boundary."""
+        if self.bomb_stage != "countdown":
+            return
+        for target in self._BOMB_SKIP_TARGETS:
+            if self.bomb_remaining > target:
+                self.bomb_remaining = target
+                self._beep_suppressed = False
+                self._update_bomb_countdown_leds()
+                self.render_bomb()
+                return
+
+    def _finish_bomb_defused(self) -> None:
+        self.bomb_stage = "ended"
+        self.bomb_end_message = "Bombe entschärft! Platzierer-Team verliert."
+
+        self._cancel_job("bomb_tick_job")
+        self._cancel_job("bomb_lock_job")
+        self._cancel_job("bomb_beep_job")
+
+        self.led.stop_all_blinkers()
+        self.led.turn_off_all()
+        self.led.turn_blue_on()
+        self.led.pixel_fill((0, 0, 255))
+
+        self.play_audio_async("Defuse")
+        self.render_bomb()
 
     def handle_bomb_input(self, key: "tk.Event[tk.Misc]") -> None:
         if self.bomb_stage in {"ended", "locked"}:
+            return
+
+        if self._is_star_key(key) and self.bomb_stage == "countdown":
+            self._dev_skip_bomb_timer()
             return
 
         if self._is_red_key(key):
@@ -590,6 +727,13 @@ class LogicWindow:
                 return
 
             self.bomb_input = []
+
+            if self.bomb_stage == "countdown":
+                if candidate == self.bomb_defuse_code:
+                    self._finish_bomb_defused()
+                else:
+                    self._handle_wrong_bomb_code()
+                return
 
             if self.bomb_stage not in {"await_code", "await_reentry"}:
                 self.render_bomb()
@@ -615,7 +759,7 @@ class LogicWindow:
                 self.render_bomb()
             return
 
-        if self.bomb_stage not in {"await_code", "await_reentry"}:
+        if self.bomb_stage not in {"await_code", "await_reentry", "countdown"}:
             return
 
         if char not in VALID_KEYS:
@@ -632,105 +776,78 @@ class LogicWindow:
 
         if rebuilt:
             self._bomb_widgets = {}
+            header, content, footer = self._create_layout()
 
-            self._bomb_widgets["title"] = tk.Label(self.root, fg="green", bg="black", text="Bombe", font=("Ubuntu", 50))
-            self._bomb_widgets["title"].pack()
-
-            self._bomb_widgets["timer"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 44))
-            self._bomb_widgets["timer"].pack()
+            self._bomb_widgets["header_title"] = self._add_header_title(header, "BOMBE")
+            self._bomb_widgets["timer"] = self._add_header_status(header)
 
             if self.bomb_stage == "await_nfc":
-                self._bomb_widgets["line1"] = tk.Label(
-                    self.root,
-                    fg="green",
-                    bg="black",
-                    text="Schwer-Modus: NFC-Karte scannen",
-                    font=("Ubuntu", 30),
+                tk.Label(content, fg=TEXT_PRIMARY, bg=BG_SCREEN, text="SCHWER-MODUS", font=FONT_SUBTITLE).pack(
+                    pady=(40, 8)
                 )
-                self._bomb_widgets["line1"].pack(pady=20)
-                self._bomb_widgets["line2"] = tk.Label(
-                    self.root,
-                    fg="green",
-                    bg="black",
-                    text="Simulation: Taste A",
-                    font=("Ubuntu", 20),
-                )
-                self._bomb_widgets["line2"].pack()
-                self._bomb_widgets["hint"] = tk.Label(
-                    self.root,
-                    fg="green",
-                    bg="black",
-                    text="# 3s halten = Hauptmenü",
-                    font=("Ubuntu", 20),
-                )
-                self._bomb_widgets["hint"].pack(pady=12)
+                tk.Label(content, fg=TEXT_PRIMARY, bg=BG_SCREEN, text="NFC-Karte scannen", font=FONT_BODY).pack(pady=4)
+                nfc_hint = "Karte an Leser halten..." if self.nfc.available else "Kein Leser \u2013 Taste A"
+                tk.Label(content, fg=TEXT_DIM, bg=BG_SCREEN, text=nfc_hint, font=FONT_HINT).pack(pady=(20, 0))
+                self._add_footer_hints(footer, left="# 3s = Menu")
+
             elif self.bomb_stage in {"await_code", "await_reentry"}:
-                self._bomb_widgets["prompt"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 28))
-                self._bomb_widgets["prompt"].pack(pady=8)
-                self._bomb_widgets["code"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 17))
-                self._bomb_widgets["code"].pack()
-                self._bomb_widgets["input"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 32))
-                self._bomb_widgets["input"].pack(pady=16)
-                self._bomb_widgets["attempts"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 24))
-                self._bomb_widgets["attempts"].pack()
-                self._bomb_widgets["hint"] = tk.Label(
-                    self.root,
-                    fg="green",
-                    bg="black",
-                    text="# 3s halten = Hauptmenü",
-                    font=("Ubuntu", 18),
-                )
-                self._bomb_widgets["hint"].pack(pady=10)
-            elif self.bomb_stage == "locked":
-                self._bomb_widgets["locked"] = tk.Label(self.root, fg="red", bg="black", font=("Ubuntu", 44))
-                self._bomb_widgets["locked"].pack(pady=40)
-                self._bomb_widgets["hint"] = tk.Label(
-                    self.root,
-                    fg="red",
-                    bg="black",
-                    text="# 3s halten = Hauptmenü",
-                    font=("Ubuntu", 18),
-                )
-                self._bomb_widgets["hint"].pack()
+                self._bomb_widgets["prompt"] = tk.Label(content, fg=TEXT_PRIMARY, bg=BG_SCREEN, font=FONT_SUBTITLE)
+                self._bomb_widgets["prompt"].pack(pady=(16, 4))
+                self._bomb_widgets["code"] = tk.Label(content, fg=TEXT_DIM, bg=BG_SCREEN, font=FONT_CODE)
+                self._bomb_widgets["code"].pack(pady=2)
+                self._bomb_widgets["input"] = tk.Label(content, fg=TEXT_PRIMARY, bg=BG_SCREEN, font=FONT_INPUT)
+                self._bomb_widgets["input"].pack(pady=(12, 4))
+                self._bomb_widgets["attempts"] = tk.Label(content, fg=TEXT_DIM, bg=BG_SCREEN, font=FONT_BODY)
+                self._bomb_widgets["attempts"].pack(pady=4)
+                self._add_footer_hints(footer, left="# 3s = Menu")
+
             elif self.bomb_stage == "countdown":
-                self._bomb_widgets["status"] = tk.Label(
-                    self.root,
-                    fg="green",
-                    bg="black",
-                    text="Countdown läuft",
-                    font=("Ubuntu", 34),
+                self._bomb_widgets["big_timer"] = tk.Label(
+                    content, fg=TEXT_PRIMARY, bg=BG_SCREEN, font=FONT_TIMER
                 )
-                self._bomb_widgets["status"].pack(pady=40)
-                self._bomb_widgets["hint"] = tk.Label(
-                    self.root,
-                    fg="green",
-                    bg="black",
-                    text="# 3s halten = Hauptmenü",
-                    font=("Ubuntu", 20),
+                self._bomb_widgets["big_timer"].pack(pady=(12, 4))
+                self._bomb_widgets["defuse_code"] = tk.Label(
+                    content, fg=TEXT_DIM, bg=BG_SCREEN, font=FONT_CODE
                 )
-                self._bomb_widgets["hint"].pack()
+                self._bomb_widgets["defuse_code"].pack(pady=(4, 2))
+                self._bomb_widgets["input"] = tk.Label(
+                    content, fg=TEXT_PRIMARY, bg=BG_SCREEN, font=FONT_INPUT
+                )
+                self._bomb_widgets["input"].pack(pady=(4, 2))
+                self._bomb_widgets["attempts"] = tk.Label(
+                    content, fg=TEXT_DIM, bg=BG_SCREEN, font=FONT_HINT
+                )
+                self._bomb_widgets["attempts"].pack(pady=2)
+                self._add_footer_hints(footer, left="# 3s = Menu")
+
+            elif self.bomb_stage == "locked":
+                self._bomb_widgets["locked"] = tk.Label(content, fg=TEXT_ALERT, bg=BG_SCREEN, font=FONT_TIMER)
+                self._bomb_widgets["locked"].pack(pady=(60, 0))
+                tk.Label(content, fg=TEXT_ALERT, bg=BG_SCREEN, text="EINGABE GESPERRT", font=FONT_SUBTITLE).pack(pady=8)
+                self._add_footer_hints(footer, left="# 3s = Menu")
+
             elif self.bomb_stage == "ended":
-                self._bomb_widgets["ended"] = tk.Label(self.root, fg="red", bg="black", font=("Ubuntu", 34))
-                self._bomb_widgets["ended"].pack(pady=40)
-                self._bomb_widgets["back"] = tk.Label(
-                    self.root,
-                    fg="green",
-                    bg="black",
-                    text="Rückkehr zum Hauptmenü...",
-                    font=("Ubuntu", 22),
+                self._bomb_widgets["ended"] = tk.Label(
+                    content, fg=TEXT_ALERT, bg=BG_SCREEN, font=FONT_BODY, wraplength=700
                 )
-                self._bomb_widgets["back"].pack()
+                self._bomb_widgets["ended"].pack(pady=(60, 12))
+                self._add_footer_hints(footer, left="# 3s = Menu")
 
         self._set_label_text(self._bomb_widgets["timer"], f"Zeit: {self.format_time(self.bomb_remaining)}")
 
-        if self.bomb_stage in {"await_code", "await_reentry"}:
+        if self.bomb_stage == "countdown" and "big_timer" in self._bomb_widgets:
+            self._set_label_text(self._bomb_widgets["big_timer"], self.format_time(self.bomb_remaining))
+            self._set_label_text(self._bomb_widgets["defuse_code"], f"Entschärfen: {self.bomb_defuse_code}")
+            self._set_label_text(self._bomb_widgets["input"], f"Eingabe: {''.join(self.bomb_input)}")
+            self._set_label_text(self._bomb_widgets["attempts"], f"Fehlversuche: {self.bomb_attempt}/3")
+        elif self.bomb_stage in {"await_code", "await_reentry"}:
             prompt = "Code zum Start:" if self.bomb_stage == "await_code" else "Neuer Code erforderlich:"
             self._set_label_text(self._bomb_widgets["prompt"], prompt)
             self._set_label_text(self._bomb_widgets["code"], self.bomb_expected_code)
             self._set_label_text(self._bomb_widgets["input"], f"Eingabe: {''.join(self.bomb_input)}")
             self._set_label_text(self._bomb_widgets["attempts"], f"Fehlversuche: {self.bomb_attempt}/3")
         elif self.bomb_stage == "locked":
-            self._set_label_text(self._bomb_widgets["locked"], f"Eingabe gesperrt: {self.bomb_lock_remaining}s")
+            self._set_label_text(self._bomb_widgets["locked"], f"{self.bomb_lock_remaining}s")
         elif self.bomb_stage == "ended":
             self._set_label_text(self._bomb_widgets["ended"], self.bomb_end_message)
 
@@ -839,41 +956,48 @@ class LogicWindow:
 
         if rebuilt:
             self._bunker_widgets = {}
-            self._bunker_widgets["title"] = tk.Label(self.root, fg="green", bg="black", text="Bunker", font=("Ubuntu", 52))
-            self._bunker_widgets["title"].pack()
-            self._bunker_widgets["status"] = tk.Label(self.root, fg="green", bg="black")
-            self._bunker_widgets["status"].pack(pady=16)
-            self._bunker_widgets["times"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 24))
+            header, content, footer = self._create_layout()
+
+            self._add_header_title(header, "BUNKER")
+            self._bunker_widgets["header_status"] = self._add_header_status(
+                header, f"Ziel: {self.BUNKER_TARGET_SECONDS}s"
+            )
+
+            self._bunker_widgets["status"] = tk.Label(content, fg=TEXT_PRIMARY, bg=BG_SCREEN)
+            self._bunker_widgets["status"].pack(pady=(24, 8))
+            self._bunker_widgets["times"] = tk.Label(content, fg=TEXT_DIM, bg=BG_SCREEN, font=FONT_BODY)
             self._bunker_widgets["times"].pack(pady=8)
-            self._bunker_widgets["footer"] = tk.Label(self.root, bg="black")
-            self._bunker_widgets["footer"].pack(pady=12)
+
+            fl, fr = self._add_footer_hints(footer, left="# 3s = Menu")
+            self._bunker_widgets["footer_left"] = fl
+            self._bunker_widgets["footer_right"] = fr
 
         status_label = self._bunker_widgets["status"]
         if self.bunker_active_team is None:
             status_text = "Warte auf Team..."
-            status_label.configure(font=("Ubuntu", 34), fg="green")
+            status_label.configure(font=FONT_SUBTITLE, fg=TEXT_DIM)
         else:
-            active_seconds = self.bunker_blue_seconds if self.bunker_active_team == "blue" else self.bunker_red_seconds
-            active_color = "BLUE" if self.bunker_active_team == "blue" else "RED"
-            status_text = f"{active_color} {self.format_time(active_seconds)}"
-            status_label.configure(font=("Ubuntu", 76), fg="green")
+            active_secs = self.bunker_blue_seconds if self.bunker_active_team == "blue" else self.bunker_red_seconds
+            active_name = "BLUE" if self.bunker_active_team == "blue" else "RED"
+            status_text = f"{active_name} {self.format_time(active_secs)}"
+            status_label.configure(font=FONT_TIMER_LARGE, fg=TEXT_PRIMARY)
         self._set_label_text(status_label, status_text)
 
-        times_text = f"Blue: {self.format_time(self.bunker_blue_seconds)}   Red: {self.format_time(self.bunker_red_seconds)}"
-        self._set_label_text(self._bunker_widgets["times"], times_text)
+        blue_t = self.format_time(self.bunker_blue_seconds)
+        red_t = self.format_time(self.bunker_red_seconds)
+        self._set_label_text(self._bunker_widgets["times"], f"Blue: {blue_t}   Red: {red_t}")
 
-        footer_label = self._bunker_widgets["footer"]
+        footer_right = self._bunker_widgets["footer_right"]
         if self.bunker_winner is None:
-            footer_label.configure(font=("Ubuntu", 18), fg="green")
-            self._set_label_text(footer_label, f"Ziel: {self.BUNKER_TARGET_SECONDS}s | # 3s halten = Hauptmenü")
+            footer_right.configure(fg=TEXT_DIM)
+            self._set_label_text(footer_right, "")
         else:
-            winner_label = "BLUE" if self.bunker_winner == "blue" else "RED"
-            footer_label.configure(font=("Ubuntu", 24), fg="red")
+            winner_name = "BLUE" if self.bunker_winner == "blue" else "RED"
+            footer_right.configure(fg=TEXT_ALERT)
             if self.bunker_signal_active:
-                footer_text = f"{winner_label} gewonnen - Signal aktiv"
+                self._set_label_text(footer_right, f"{winner_name} gewonnen - Signal aktiv")
             else:
-                footer_text = f"{winner_label} bei 600s - * gedrückt halten zum Beenden"
-            self._set_label_text(footer_label, footer_text)
+                self._set_label_text(footer_right, f"{winner_name} bei 600s - * halten")
 
     # ----------------------------
     # Flag mode
@@ -920,18 +1044,14 @@ class LogicWindow:
 
         if rebuilt:
             self._flag_widgets = {}
-            self._flag_widgets["title"] = tk.Label(self.root, fg="green", bg="black", text="Flagge", font=("Ubuntu", 52))
-            self._flag_widgets["title"].pack(pady=10)
-            self._flag_widgets["team"] = tk.Label(self.root, fg="green", bg="black", font=("Ubuntu", 140))
-            self._flag_widgets["team"].pack(pady=30)
-            self._flag_widgets["hint"] = tk.Label(
-                self.root,
-                fg="green",
-                bg="black",
-                text="# 3s halten = Hauptmenü",
-                font=("Ubuntu", 22),
-            )
-            self._flag_widgets["hint"].pack()
+            header, content, footer = self._create_layout()
+
+            self._add_header_title(header, "FLAGGE")
+
+            self._flag_widgets["team"] = tk.Label(content, fg=TEXT_PRIMARY, bg=BG_SCREEN, font=FONT_FLAG_TEAM)
+            self._flag_widgets["team"].pack(expand=True)
+
+            self._add_footer_hints(footer, left="# 3s = Menu")
 
         label = "-"
         if self.flag_team == "red":

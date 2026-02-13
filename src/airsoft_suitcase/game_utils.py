@@ -26,6 +26,7 @@ AUDIO_FILES = {
     "Boom": ASSETS_DIR / "audio" / "boom.mp3",
     "Arm": ASSETS_DIR / "audio" / "arm.mp3",
     "Defuse": ASSETS_DIR / "audio" / "defuse.mp3",
+    "beep": ASSETS_DIR / "audio" / "beep.wav",
 }
 
 VALID_KEYS = set(KEYPAD_CHARACTERS)
